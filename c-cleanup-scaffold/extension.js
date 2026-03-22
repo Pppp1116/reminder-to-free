@@ -1,422 +1,317 @@
 const vscode = require("vscode");
+const core = require("./core");
 
 let isApplyingEdit = false;
+let scaffoldDecorationType = null;
 
 function activate(context) {
-  const refreshCommand = vscode.commands.registerCommand(
-    "cCleanupScaffold.refreshDocument",
-    async () => {
-      const editor = vscode.window.activeTextEditor;
-      if (!editor) return;
-      await processDocument(editor.document, true);
-    }
-  );
-
-  const disposable = vscode.workspace.onDidChangeTextDocument(async (event) => {
-    if (isApplyingEdit) return;
-
-    const editor = vscode.window.activeTextEditor;
-    if (!editor) return;
-    if (editor.document !== event.document) return;
-
-    await processDocument(event.document, false, event.contentChanges);
+  scaffoldDecorationType = vscode.window.createTextEditorDecorationType({
+    isWholeLine: true,
+    opacity: "0.75",
+    color: new vscode.ThemeColor("editorCodeLens.foreground")
   });
 
-  context.subscriptions.push(refreshCommand, disposable);
+  const subscriptions = [
+    vscode.commands.registerCommand(
+      "cCleanupScaffold.refreshDocument",
+      async () => {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) return;
+
+        await processDocument(editor.document, { kind: "document" });
+      }
+    ),
+    vscode.commands.registerCommand(
+      "cCleanupScaffold.scaffoldCurrentLine",
+      async () => {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) return;
+
+        await processDocument(editor.document, {
+          kind: "line",
+          lineNumber: editor.selection.active.line
+        });
+      }
+    ),
+    vscode.commands.registerCommand(
+      "cCleanupScaffold.scaffoldCurrentFunction",
+      async () => {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) return;
+
+        await processDocument(editor.document, {
+          kind: "function",
+          lineNumber: editor.selection.active.line
+        });
+      }
+    ),
+    vscode.commands.registerCommand(
+      "cCleanupScaffold.finalizeScaffold",
+      async () => {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor || !isSupportedDocument(editor.document)) return;
+
+        const lines = getDocumentLines(editor.document);
+        const edits = core.planFinalizeEdits(lines, getFinalizeScope(editor));
+        await applyPlannedEdits(editor, edits);
+      }
+    ),
+    vscode.commands.registerCommand(
+      "cCleanupScaffold.removeScaffoldMarkers",
+      async () => {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor || !isSupportedDocument(editor.document)) return;
+
+        const lines = getDocumentLines(editor.document);
+        const edits = core.planFinalizeEdits(lines, { kind: "document" });
+        await applyPlannedEdits(editor, edits);
+      }
+    ),
+    vscode.workspace.onDidChangeTextDocument(async (event) => {
+      if (isApplyingEdit) return;
+
+      const editor = vscode.window.activeTextEditor;
+      if (!editor) return;
+      if (editor.document !== event.document) return;
+
+      await processDocument(event.document, {
+        kind: "lines",
+        lineNumbers: collectTouchedLines(event.contentChanges, event.document.lineCount)
+      });
+    }),
+    vscode.window.onDidChangeActiveTextEditor((editor) => {
+      refreshDecorations(editor);
+    }),
+    vscode.workspace.onDidOpenTextDocument((document) => {
+      const editor = vscode.window.activeTextEditor;
+      if (editor && editor.document === document) {
+        refreshDecorations(editor);
+      }
+    })
+  ];
+
+  context.subscriptions.push(scaffoldDecorationType, ...subscriptions);
+  refreshDecorations(vscode.window.activeTextEditor);
 }
 
-async function processDocument(doc, fullRefresh, changes = []) {
-  if (!isSupportedDocument(doc)) return;
+async function processDocument(document, scope) {
+  if (!isSupportedDocument(document)) return;
 
   const editor = vscode.window.activeTextEditor;
-  if (!editor || editor.document !== doc) return;
+  if (!editor || editor.document !== document) return;
 
   const config = getConfig();
-  if (!config.enabled) return;
-
-  const analysis = analyzeDocument(doc, config);
-  const edits = [];
-
-  if (config.detectOwnedReturnFunctions) {
-    for (const fn of analysis.functions) {
-      if (!fn.returnsOwnedAllocation) continue;
-
-      for (const alloc of fn.allocations) {
-        const scaffold = findScaffoldCleanupBelow(doc, alloc.line, alloc.varName, config.cleanupFunctionName, fn.endLine);
-        if (scaffold) {
-          edits.push({
-            kind: "delete",
-            range: scaffold.range
-          });
-        }
-      }
-    }
+  if (!config.enabled) {
+    refreshDecorations(editor);
+    return;
   }
 
-  const targetLines = fullRefresh
-    ? [...Array(doc.lineCount).keys()]
-    : collectTouchedLines(changes, doc.lineCount);
+  const lines = getDocumentLines(document);
+  const plan = core.planScaffoldEdits(lines, config, scope);
+  await applyPlannedEdits(editor, plan.edits);
+}
 
-  for (const lineNumber of targetLines) {
-    const line = doc.lineAt(lineNumber);
-    const text = line.text;
-
-    const directAlloc = parseDirectAllocationLine(text, config.allocatorFunctions);
-    if (directAlloc) {
-      const ownerFn = findContainingFunction(analysis.functions, lineNumber);
-      if (ownerFn && ownerFn.returnsOwnedAllocation && ownerFn.ownedVars.has(directAlloc.varName)) {
-        continue;
-      }
-
-      const existing = findScaffoldCleanupBelow(
-        doc,
-        lineNumber,
-        directAlloc.varName,
-        config.cleanupFunctionName,
-        ownerFn ? ownerFn.endLine : doc.lineCount - 1
-      );
-
-      if (!existing) {
-        edits.push(makeInsertEdit(lineNumber, directAlloc.indent, directAlloc.varName, config.cleanupFunctionName));
-      }
-
-      continue;
-    }
-
-    if (config.detectOwnedReturnFunctions) {
-      const callAlloc = parseOwnedFactoryCallAssignment(text, analysis.ownedFunctionNames);
-      if (callAlloc) {
-        const ownerFn = findContainingFunction(analysis.functions, lineNumber);
-        const existing = findScaffoldCleanupBelow(
-          doc,
-          lineNumber,
-          callAlloc.varName,
-          config.cleanupFunctionName,
-          ownerFn ? ownerFn.endLine : doc.lineCount - 1
-        );
-
-        if (!existing) {
-          edits.push(makeInsertEdit(lineNumber, callAlloc.indent, callAlloc.varName, config.cleanupFunctionName));
-        }
-      }
-    }
+async function applyPlannedEdits(editor, edits) {
+  if (!edits.length) {
+    refreshDecorations(editor);
+    return;
   }
 
-  const finalEdits = dedupeEdits(edits);
-  if (!finalEdits.length) return;
-
-  const oldSelections = editor.selections.map(
-    (s) => new vscode.Selection(s.start, s.end)
-  );
+  const translatedSelections = translateSelections(editor, edits);
 
   isApplyingEdit = true;
   try {
     await editor.edit((editBuilder) => {
-      for (const edit of sortEditsDescending(finalEdits)) {
-        if (edit.kind === "delete") {
-          editBuilder.delete(edit.range);
-        } else if (edit.kind === "insert") {
-          editBuilder.insert(edit.position, edit.text);
+      for (const edit of sortEditsDescending(edits)) {
+        if (edit.kind === "insert") {
+          editBuilder.insert(
+            new vscode.Position(edit.afterLine + 1, 0),
+            `${edit.text}\n`
+          );
+          continue;
+        }
+
+        if (edit.kind === "deleteLine") {
+          editBuilder.delete(getLineDeleteRange(editor.document, edit.lineNumber));
+          continue;
+        }
+
+        if (edit.kind === "replaceLine") {
+          editBuilder.replace(editor.document.lineAt(edit.lineNumber).range, edit.text);
         }
       }
     });
-    editor.selections = oldSelections;
+
+    editor.selections = translatedSelections;
   } finally {
     isApplyingEdit = false;
+    refreshDecorations(editor);
   }
 }
 
-function isSupportedDocument(doc) {
-  return doc && (doc.languageId === "c" || doc.languageId === "cpp");
+function refreshDecorations(editor) {
+  if (!scaffoldDecorationType) return;
+  if (!editor || !isSupportedDocument(editor.document)) {
+    if (editor) {
+      editor.setDecorations(scaffoldDecorationType, []);
+    }
+    return;
+  }
+
+  const lines = getDocumentLines(editor.document);
+  const options = core.collectManagedScaffoldLines(lines).map((scaffold) => ({
+    range: editor.document.lineAt(scaffold.line).range,
+    hoverMessage: "Auto-inserted cleanup scaffold. Keep typing above it, move it when you want, or finalize it to make it yours."
+  }));
+
+  editor.setDecorations(scaffoldDecorationType, options);
 }
 
 function getConfig() {
-  const cfg = vscode.workspace.getConfiguration("cCleanupScaffold");
-  const allocatorFunctions = cfg.get("allocatorFunctions", [
-    "malloc",
-    "calloc",
-    "realloc",
-    "strdup",
-    "strndup"
-  ]);
+  const config = vscode.workspace.getConfiguration("cCleanupScaffold");
 
   return {
-    enabled: cfg.get("enabled", true),
-    detectOwnedReturnFunctions: cfg.get("detectOwnedReturnFunctions", true),
-    allocatorFunctions: allocatorFunctions.filter(Boolean),
-    cleanupFunctionName: cfg.get("cleanupFunctionName", "free")
+    enabled: config.get("enabled", true),
+    detectOwnedReturnFunctions: config.get("detectOwnedReturnFunctions", true),
+    allocatorFunctions: config.get("allocatorFunctions", [
+      "malloc",
+      "calloc",
+      "realloc",
+      "strdup",
+      "strndup"
+    ]),
+    cleanupFunctionName: config.get("cleanupFunctionName", "free"),
+    cleanupMap: config.get("cleanupMap", {
+      malloc: "free",
+      calloc: "free",
+      realloc: "free",
+      strdup: "free",
+      strndup: "free"
+    }),
+    ownedReturnFunctions: config.get("ownedReturnFunctions", [])
   };
 }
 
-function analyzeDocument(doc, config) {
+function isSupportedDocument(document) {
+  return document && (document.languageId === "c" || document.languageId === "cpp");
+}
+
+function getDocumentLines(document) {
   const lines = [];
-  for (let i = 0; i < doc.lineCount; i++) {
-    lines.push(doc.lineAt(i).text);
+
+  for (let i = 0; i < document.lineCount; i++) {
+    lines.push(document.lineAt(i).text);
   }
 
-  const functions = findFunctions(lines, config.allocatorFunctions);
-  const ownedFunctionNames = new Set(
-    functions.filter((fn) => fn.returnsOwnedAllocation).map((fn) => fn.name)
-  );
-
-  return { functions, ownedFunctionNames };
-}
-
-function findFunctions(lines, allocatorFunctions) {
-  const functions = [];
-  const allocatorRegex = buildAllocatorRegex(allocatorFunctions);
-
-  let pending = null;
-  let braceDepth = 0;
-  let current = null;
-
-  for (let i = 0; i < lines.length; i++) {
-    const raw = lines[i];
-    const text = stripLineComment(raw);
-    const trimmed = text.trim();
-
-    if (!current) {
-      if (!pending) {
-        const maybeName = extractFunctionNameFromHeaderLine(trimmed);
-        if (maybeName) {
-          pending = { name: maybeName, startLine: i };
-        }
-      } else {
-        if (!trimmed || trimmed.startsWith("//")) {
-        } else if (trimmed.includes("{")) {
-          current = {
-            name: pending.name,
-            startLine: pending.startLine,
-            headerEndLine: i,
-            bodyStartLine: i,
-            endLine: i,
-            allocations: [],
-            returnsOwnedAllocation: false,
-            ownedVars: new Set()
-          };
-          braceDepth = countChar(text, "{") - countChar(text, "}");
-          pending = null;
-
-          if (braceDepth === 0) {
-            current.endLine = i;
-            finalizeFunction(current, lines, allocatorRegex);
-            functions.push(current);
-            current = null;
-          }
-          continue;
-        } else if (trimmed.endsWith(";")) {
-          pending = null;
-        }
-      }
-    }
-
-    if (current) {
-      if (i > current.bodyStartLine) {
-        braceDepth += countChar(text, "{");
-        braceDepth -= countChar(text, "}");
-      }
-
-      if (braceDepth <= 0) {
-        current.endLine = i;
-        finalizeFunction(current, lines, allocatorRegex);
-        functions.push(current);
-        current = null;
-        pending = null;
-      }
-    }
-  }
-
-  return functions;
-}
-
-function finalizeFunction(fn, lines, allocatorRegex) {
-  for (let i = fn.bodyStartLine; i <= fn.endLine; i++) {
-    const text = stripLineComment(lines[i]);
-    const alloc = parseDirectAllocationLine(text, allocatorRegex, true);
-    if (alloc) {
-      alloc.line = i;
-      fn.allocations.push(alloc);
-      fn.ownedVars.add(alloc.varName);
-    }
-  }
-
-  for (let i = fn.bodyStartLine; i <= fn.endLine; i++) {
-    const text = stripLineComment(lines[i]);
-    const m = text.match(/^\s*return\s+([A-Za-z_]\w*)\s*;/);
-    if (m && fn.ownedVars.has(m[1])) {
-      fn.returnsOwnedAllocation = true;
-      break;
-    }
-  }
-}
-
-function parseDirectAllocationLine(text, allocatorFunctionsOrRegex, regexAlreadyBuilt = false) {
-  const allocatorRegex = regexAlreadyBuilt
-    ? allocatorFunctionsOrRegex
-    : buildAllocatorRegex(allocatorFunctionsOrRegex);
-
-  const trimmed = stripLineComment(text).trim();
-  if (!trimmed.endsWith(";")) return null;
-  if (!allocatorRegex.test(trimmed)) return null;
-
-  const namesSource = allocatorRegex.source
-    .replace(/^\\b\(\?:/, "")
-    .replace(/\\s\*\\\($/, "");
-
-  const typedPattern = new RegExp(
-    String.raw`^(?:[A-Za-z_]\w*(?:\s+|\s*\*+\s*))+?([A-Za-z_]\w*)\s*=\s*(?:\([^)]*\)\s*)?(?:${namesSource})\s*\(`
-  );
-  const plainPattern = new RegExp(
-    String.raw`^([A-Za-z_]\w*)\s*=\s*(?:\([^)]*\)\s*)?(?:${namesSource})\s*\(`
-  );
-
-  const match = trimmed.match(typedPattern) || trimmed.match(plainPattern);
-  if (!match) return null;
-
-  return {
-    varName: match[1],
-    indent: text.match(/^\s*/)?.[0] ?? ""
-  };
-}
-
-function parseOwnedFactoryCallAssignment(text, ownedFunctionNames) {
-  if (!ownedFunctionNames || !ownedFunctionNames.size) return null;
-
-  const trimmed = stripLineComment(text).trim();
-  if (!trimmed.endsWith(";")) return null;
-
-  const names = [...ownedFunctionNames].map(escapeRegex).join("|");
-  const typedPattern = new RegExp(
-    String.raw`^(?:[A-Za-z_]\w*(?:\s+|\s*\*+\s*))+?([A-Za-z_]\w*)\s*=\s*(${names})\s*\(`
-  );
-  const plainPattern = new RegExp(
-    String.raw`^([A-Za-z_]\w*)\s*=\s*(${names})\s*\(`
-  );
-
-  const match = trimmed.match(typedPattern) || trimmed.match(plainPattern);
-  if (!match) return null;
-
-  return {
-    varName: match[1],
-    callee: match[2],
-    indent: text.match(/^\s*/)?.[0] ?? ""
-  };
-}
-
-function findScaffoldCleanupBelow(doc, startLine, varName, cleanupFunctionName, maxLine) {
-  const pattern = new RegExp(`^\\s*${escapeRegex(cleanupFunctionName)}\\s*\\(\\s*${escapeRegex(varName)}\\s*\\)\\s*;\\s*$`);
-
-  for (let i = startLine + 1; i <= maxLine && i < doc.lineCount; i++) {
-    const text = doc.lineAt(i).text;
-    const trimmed = text.trim();
-
-    if (!trimmed) continue;
-    if (pattern.test(text)) {
-      const start = new vscode.Position(i, 0);
-      const end = i + 1 < doc.lineCount
-        ? new vscode.Position(i + 1, 0)
-        : new vscode.Position(i, text.length);
-      return {
-        line: i,
-        range: new vscode.Range(start, end)
-      };
-    }
-  }
-
-  return null;
-}
-
-function makeInsertEdit(lineNumber, indent, varName, cleanupFunctionName) {
-  return {
-    kind: "insert",
-    position: new vscode.Position(lineNumber + 1, 0),
-    text: `${indent}${cleanupFunctionName}(${varName});\n`
-  };
+  return lines;
 }
 
 function collectTouchedLines(changes, lineCount) {
-  const set = new Set();
+  const lineNumbers = new Set();
 
   for (const change of changes) {
-    const start = Math.max(0, change.range.start.line - 2);
-    const end = Math.min(lineCount - 1, change.range.end.line + 2);
+    const insertedLineCount = change.text.split("\n").length - 1;
+    const start = Math.max(0, change.range.start.line - 1);
+    const end = Math.min(
+      lineCount - 1,
+      Math.max(change.range.end.line, change.range.start.line + insertedLineCount) + 1
+    );
+
     for (let i = start; i <= end; i++) {
-      set.add(i);
+      lineNumbers.add(i);
     }
   }
 
-  return [...set].sort((a, b) => a - b);
+  return [...lineNumbers].sort((a, b) => a - b);
 }
 
-function findContainingFunction(functions, lineNumber) {
-  return functions.find((fn) => lineNumber >= fn.startLine && lineNumber <= fn.endLine) || null;
-}
+function getFinalizeScope(editor) {
+  const selection = editor.selection;
 
-function extractFunctionNameFromHeaderLine(trimmed) {
-  if (!trimmed) return null;
-  if (trimmed.startsWith("#")) return null;
-  if (/^(if|for|while|switch|return|sizeof)\b/.test(trimmed)) return null;
-  if (!trimmed.includes("(") || !trimmed.includes(")")) return null;
+  if (!selection.isEmpty) {
+    const lineNumbers = [];
+    for (let i = selection.start.line; i <= selection.end.line; i++) {
+      lineNumbers.push(i);
+    }
 
-  const match = trimmed.match(/([A-Za-z_]\w*)\s*\([^;]*\)\s*(?:\{|$)/);
-  if (!match) return null;
-
-  const name = match[1];
-  if (["if", "for", "while", "switch"].includes(name)) return null;
-  return name;
-}
-
-function buildAllocatorRegex(allocatorFunctions) {
-  const names = allocatorFunctions.map(escapeRegex).join("|");
-  return new RegExp(`\\b(?:${names})\\s*\\(`);
-}
-
-function stripLineComment(text) {
-  return text.replace(/\/\/.*$/, "");
-}
-
-function countChar(text, ch) {
-  let count = 0;
-  for (const c of text) {
-    if (c === ch) count++;
+    return {
+      kind: "lines",
+      lineNumbers
+    };
   }
-  return count;
+
+  return {
+    kind: "function",
+    lineNumber: selection.active.line
+  };
 }
 
-function dedupeEdits(edits) {
-  const seen = new Set();
-  const result = [];
+function getLineDeleteRange(document, lineNumber) {
+  return document.lineAt(lineNumber).rangeIncludingLineBreak;
+}
+
+function translateSelections(editor, edits) {
+  return editor.selections.map((selection) => {
+    const start = translatePosition(editor.document, selection.start, edits);
+    const end = translatePosition(editor.document, selection.end, edits);
+    return new vscode.Selection(start, end);
+  });
+}
+
+function translatePosition(document, position, edits) {
+  let line = position.line;
 
   for (const edit of edits) {
-    const key = edit.kind === "delete"
-      ? `d:${edit.range.start.line}:${edit.range.start.character}:${edit.range.end.line}:${edit.range.end.character}`
-      : `i:${edit.position.line}:${edit.position.character}:${edit.text}`;
+    if (edit.kind === "insert") {
+      if (edit.afterLine < line) {
+        line += countInsertedLines(edit.text);
+      }
+      continue;
+    }
 
-    if (seen.has(key)) continue;
-    seen.add(key);
-    result.push(edit);
+    if (edit.kind === "deleteLine" && edit.lineNumber < line) {
+      line -= 1;
+      continue;
+    }
+
+    if (edit.kind === "deleteLine" && edit.lineNumber === line) {
+      line = Math.max(0, line - 1);
+    }
   }
 
-  return result;
+  const safeLine = Math.min(Math.max(0, line), document.lineCount - 1);
+  const maxCharacter = document.lineCount
+    ? document.lineAt(safeLine).text.length
+    : position.character;
+  return new vscode.Position(Math.max(0, line), Math.min(position.character, maxCharacter));
+}
+
+function countInsertedLines(text) {
+  return text.split("\n").length - 1 || 1;
 }
 
 function sortEditsDescending(edits) {
   return edits.slice().sort((a, b) => {
-    const aLine = a.kind === "delete" ? a.range.start.line : a.position.line;
-    const bLine = b.kind === "delete" ? b.range.start.line : b.position.line;
+    const aLine = editLineNumber(a);
+    const bLine = editLineNumber(b);
     if (aLine !== bLine) return bLine - aLine;
 
-    const aChar = a.kind === "delete" ? a.range.start.character : a.position.character;
-    const bChar = b.kind === "delete" ? b.range.start.character : b.position.character;
-    return bChar - aChar;
+    const order = { deleteLine: 0, replaceLine: 1, insert: 2 };
+    return order[a.kind] - order[b.kind];
   });
 }
 
-function escapeRegex(s) {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+function editLineNumber(edit) {
+  if (edit.kind === "insert") return edit.afterLine + 1;
+  return edit.lineNumber;
 }
 
-function deactivate() {}
+function deactivate() {
+  if (scaffoldDecorationType) {
+    scaffoldDecorationType.dispose();
+    scaffoldDecorationType = null;
+  }
+}
 
 module.exports = {
   activate,

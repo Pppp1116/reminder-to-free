@@ -4,6 +4,9 @@
   "description": "Scaffolds free(...) for direct allocations and for caller-owned helper functions that return allocated memory.",
   "version": "0.1.0",
   "publisher": "local",
+  "scripts": {
+    "test": "node --test ./test/**/*.test.js"
+  },
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -21,7 +24,11 @@
   "activationEvents": [
     "onLanguage:c",
     "onLanguage:cpp",
-    "onCommand:cCleanupScaffold.refreshDocument"
+    "onCommand:cCleanupScaffold.refreshDocument",
+    "onCommand:cCleanupScaffold.scaffoldCurrentLine",
+    "onCommand:cCleanupScaffold.scaffoldCurrentFunction",
+    "onCommand:cCleanupScaffold.finalizeScaffold",
+    "onCommand:cCleanupScaffold.removeScaffoldMarkers"
   ],
   "main": "./extension.js",
   "contributes": {
@@ -29,6 +36,22 @@
       {
         "command": "cCleanupScaffold.refreshDocument",
         "title": "C Cleanup Scaffold: Refresh Current Document"
+      },
+      {
+        "command": "cCleanupScaffold.scaffoldCurrentLine",
+        "title": "C Cleanup Scaffold: Scaffold Cleanup For Current Line"
+      },
+      {
+        "command": "cCleanupScaffold.scaffoldCurrentFunction",
+        "title": "C Cleanup Scaffold: Scaffold Cleanup For Function"
+      },
+      {
+        "command": "cCleanupScaffold.finalizeScaffold",
+        "title": "C Cleanup Scaffold: Finalize Scaffold"
+      },
+      {
+        "command": "cCleanupScaffold.removeScaffoldMarkers",
+        "title": "C Cleanup Scaffold: Remove Scaffold Markers"
       }
     ],
     "configuration": {
@@ -42,7 +65,7 @@
         "cCleanupScaffold.detectOwnedReturnFunctions": {
           "type": "boolean",
           "default": true,
-          "description": "Detect helper functions that allocate and return owned memory, then scaffold free(...) at call sites instead of inside the helper."
+          "description": "Use a lightweight single-return heuristic to treat local helper functions as returning owned memory."
         },
         "cCleanupScaffold.allocatorFunctions": {
           "type": "array",
@@ -56,12 +79,31 @@
           "items": {
             "type": "string"
           },
-          "description": "Function names treated as allocation sources."
+          "description": "Legacy allocator list. These names use cleanupFunctionName."
         },
         "cCleanupScaffold.cleanupFunctionName": {
           "type": "string",
           "default": "free",
-          "description": "Cleanup function inserted for owned heap memory."
+          "description": "Cleanup function used for owned-return function calls and legacy allocatorFunctions."
+        },
+        "cCleanupScaffold.cleanupMap": {
+          "type": "object",
+          "default": {
+            "malloc": "free",
+            "calloc": "free",
+            "realloc": "free",
+            "strdup": "free",
+            "strndup": "free"
+          },
+          "description": "Allocator-to-cleanup mapping for direct assignment lines."
+        },
+        "cCleanupScaffold.ownedReturnFunctions": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "description": "Function names treated as returning owned memory that should get an immediate cleanup scaffold."
         }
       }
     }
