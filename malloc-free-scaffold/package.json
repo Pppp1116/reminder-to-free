@@ -1,0 +1,30 @@
+{
+  "name": "malloc-free-scaffold",
+  "displayName": "Malloc Free Scaffold",
+  "description": "Automatically inserts free(variable); after malloc lines in C/C++ while keeping the cursor between allocation and cleanup.",
+  "version": "0.0.1",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:c",
+    "onLanguage:cpp"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "Malloc Free Scaffold",
+      "properties": {
+        "mallocFreeScaffold.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable automatic insertion of free(...) after malloc lines."
+        }
+      }
+    }
+  }
+}
