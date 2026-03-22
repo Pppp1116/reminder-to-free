@@ -161,11 +161,11 @@ function analyzeOwnedReturnFunction(fn, rawLines, sanitizedLines, config) {
   const createdVars = new Map();
   let returnVar = null;
   let sawReturn = false;
+  const statements = collectRelevantStatements(fn, rawLines, sanitizedLines);
 
-  for (let i = fn.bodyStartLine; i <= fn.endLine; i++) {
-    const creation = parseOwnershipCreationLine(
-      rawLines[i],
-      sanitizedLines[i],
+  for (const statement of statements) {
+    const creation = parseOwnershipCreationStatement(
+      statement,
       config,
       new Map()
     );
@@ -178,11 +178,12 @@ function analyzeOwnedReturnFunction(fn, rawLines, sanitizedLines, config) {
       createdVars.set(creation.varName, creation.cleanupFunction);
     }
 
-    if (/^\s*return\b/.test(sanitizedLines[i])) {
+    const trimmed = compactSanitizedText(statement.sanitizedText);
+    if (/^\s*return\b/.test(trimmed)) {
       if (sawReturn) return null;
       sawReturn = true;
 
-      const returnMatch = sanitizedLines[i].match(/^\s*return\s+([A-Za-z_]\w*)\s*;\s*$/);
+      const returnMatch = trimmed.match(/^\s*return\s+([A-Za-z_]\w*)\s*;\s*$/);
       if (!returnMatch) return null;
       returnVar = returnMatch[1];
     }
@@ -222,6 +223,29 @@ function parseOwnershipCreationLine(rawLine, sanitizedLine, config, ownedReturnF
   };
 }
 
+function parseOwnershipCreationStatement(statement, config, ownedReturnFunctions) {
+  const trimmed = compactSanitizedText(statement.sanitizedText);
+  if (!trimmed || !trimmed.endsWith(";")) return null;
+
+  const assignment = matchAssignedCall(trimmed);
+  if (!assignment) return null;
+
+  const cleanupFunction = config.cleanupMap[assignment.callee]
+    || (ownedReturnFunctions instanceof Map ? ownedReturnFunctions.get(assignment.callee)?.cleanupFunction : null)
+    || (ownedReturnFunctions instanceof Set && ownedReturnFunctions.has(assignment.callee)
+      ? config.cleanupFunctionName
+      : null);
+
+  if (!cleanupFunction) return null;
+
+  return {
+    varName: assignment.varName,
+    cleanupFunction,
+    callee: assignment.callee,
+    indent: rawLinesIndent(statement.rawText)
+  };
+}
+
 function matchAssignedCall(trimmedLine) {
   const typedPattern = /^(?:[A-Za-z_]\w*(?:\s+|\s*\*+\s*))+?([A-Za-z_]\w*)\s*=\s*(?:\([^)]*\)\s*)?([A-Za-z_]\w*)\s*\(/;
   const plainPattern = /^([A-Za-z_]\w*)\s*=\s*(?:\([^)]*\)\s*)?([A-Za-z_]\w*)\s*\(/;
@@ -258,22 +282,6 @@ function parseManagedScaffoldLine(rawLine) {
     varName: parsed.varName,
     indent: rawLine.match(/^\s*/)?.[0] ?? ""
   };
-}
-
-function findCleanupBelow(rawLines, startLine, varName, cleanupFunction, maxLine) {
-  for (let i = startLine + 1; i <= maxLine && i < rawLines.length; i++) {
-    const cleanup = parseManagedScaffoldLine(rawLines[i]);
-    if (!cleanup) continue;
-    if (cleanup.varName !== varName) continue;
-    if (cleanup.cleanupFunction !== cleanupFunction) continue;
-
-    return {
-      line: i,
-      markerPresent: true
-    };
-  }
-
-  return null;
 }
 
 function findDuplicateManagedCleanupEdits(rawLines, firstCleanupLine, varName, cleanupFunction) {
@@ -361,109 +369,78 @@ function planFunctionScaffoldEdits(
   manualOptOuts
 ) {
   const edits = [];
-  const desiredCreations = [];
-  const ownedReturnInfo = ownedReturnFunctions.get(fn.name) || null;
+  const statements = collectRelevantStatements(fn, rawLines, sanitizedLines);
+  const creationPlan = collectDesiredCreations(
+    fn,
+    statements,
+    config,
+    ownedReturnFunctions,
+    takesOwnershipFunctions,
+    scope,
+    targetLineSet
+  );
+  const desiredCreations = creationPlan.desiredCreations;
+  const exactMatches = matchExactManagedScaffolds(rawLines, desiredCreations, managedScaffolds);
+  const matchedDesired = new Set(exactMatches.matchedDesired);
+  const matchedManaged = new Set(exactMatches.matchedManaged);
+  const frozenDesired = new Set();
+  const frozenManaged = new Set();
 
-  for (let i = fn.bodyStartLine; i <= fn.endLine; i++) {
-    const creation = parseOwnershipCreationLine(
-      rawLines[i],
-      sanitizedLines[i],
-      config,
-      ownedReturnFunctions
-    );
-
-    if (!creation) continue;
-    if (
-      ownedReturnInfo
-      && ownedReturnInfo.returnVar === creation.varName
-      && ownedReturnInfo.cleanupFunction === creation.cleanupFunction
-    ) {
-      continue;
-    }
-
-    if (doesCreationTransferOwnership(fn, i, creation.varName, sanitizedLines, takesOwnershipFunctions)) {
-      continue;
-    }
-
-    desiredCreations.push({
-      ...creation,
-      line: i,
-      insertEligible: isInsertEligibleForScope(scope, targetLineSet, i),
-      optOutKey: buildManagedOwnershipKey(fn.name, creation.varName, creation.cleanupFunction)
-    });
-  }
-
-  const matchedDesired = new Set();
-  const matchedManaged = new Set();
-
-  for (let desiredIndex = 0; desiredIndex < desiredCreations.length; desiredIndex++) {
-    const creation = desiredCreations[desiredIndex];
-    const existingCleanup = findManagedCleanupBelow(
+  edits.push(...exactMatches.duplicateEdits);
+  edits.push(
+    ...matchTransferredManagedScaffolds(
+      creationPlan.transferredCreations,
       managedScaffolds,
-      creation.line,
-      creation.varName,
-      creation.cleanupFunction
-    );
+      matchedManaged
+    )
+  );
 
-    if (!existingCleanup) continue;
+  const renamePlan = planSegmentRenameMatches(
+    desiredCreations,
+    managedScaffolds,
+    matchedDesired,
+    matchedManaged,
+    manualOptOuts
+  );
 
-    matchedDesired.add(desiredIndex);
-    matchedManaged.add(existingCleanup.line);
-
-    if (existingCleanup.line === creation.line + 1) {
-      edits.push(
-        ...findDuplicateManagedCleanupEdits(
-          rawLines,
-          existingCleanup.line,
-          creation.varName,
-          creation.cleanupFunction
-        )
-      );
-    }
-  }
-
-  const renameCandidates = desiredCreations
-    .map((creation, index) => ({ ...creation, index }))
-    .filter(
-      (creation) => !matchedDesired.has(creation.index)
-        && creation.insertEligible
-        && !manualOptOuts.has(creation.optOutKey)
-    );
-  const unmatchedManaged = managedScaffolds.filter((scaffold) => !matchedManaged.has(scaffold.line));
-  const renameGroups = groupRenameCandidates(renameCandidates, unmatchedManaged);
-
-  for (const group of renameGroups) {
-    if (!group.scaffold || !group.creation) continue;
-    if (group.scaffold.line <= group.creation.line) continue;
-
+  for (const pair of renamePlan.pairs) {
     edits.push({
       kind: "replaceLine",
-      lineNumber: group.scaffold.line,
+      lineNumber: pair.scaffold.line,
       text: formatScaffoldLine(
-        group.scaffold.indent,
-        group.creation.varName,
-        group.creation.cleanupFunction
+        pair.scaffold.indent,
+        pair.creation.varName,
+        pair.creation.cleanupFunction
       )
     });
-    matchedDesired.add(group.creation.index);
-    matchedManaged.add(group.scaffold.line);
+    matchedDesired.add(pair.creation.index);
+    matchedManaged.add(pair.scaffold.line);
+  }
+
+  for (const index of renamePlan.frozenDesired) {
+    frozenDesired.add(index);
+  }
+
+  for (const line of renamePlan.frozenManaged) {
+    frozenManaged.add(line);
   }
 
   for (let desiredIndex = 0; desiredIndex < desiredCreations.length; desiredIndex++) {
     const creation = desiredCreations[desiredIndex];
-    if (matchedDesired.has(desiredIndex)) continue;
+    if (matchedDesired.has(desiredIndex) || frozenDesired.has(desiredIndex)) continue;
     if (!creation.insertEligible) continue;
     if (manualOptOuts.has(creation.optOutKey)) continue;
 
     edits.push({
       kind: "insert",
-      afterLine: creation.line,
+      afterLine: creation.endLine,
       text: formatScaffoldLine(creation.indent, creation.varName, creation.cleanupFunction)
     });
   }
 
   for (const scaffold of managedScaffolds) {
-    if (matchedManaged.has(scaffold.line)) continue;
+    if (matchedManaged.has(scaffold.line) || frozenManaged.has(scaffold.line)) continue;
+    if (!isConfidentOrphanScaffold(fn, scaffold, statements)) continue;
 
     edits.push({
       kind: "deleteLine",
@@ -474,34 +451,18 @@ function planFunctionScaffoldEdits(
   return edits;
 }
 
-function groupRenameCandidates(desiredCreations, unmatchedManaged) {
-  const allCleanupFunctions = new Set([
-    ...desiredCreations.map((creation) => creation.cleanupFunction),
-    ...unmatchedManaged.map((scaffold) => scaffold.cleanupFunction)
-  ]);
-  const groups = [];
-
-  for (const cleanupFunction of allCleanupFunctions) {
-    const desiredGroup = desiredCreations.filter((creation) => creation.cleanupFunction === cleanupFunction);
-    const managedGroup = unmatchedManaged.filter((scaffold) => scaffold.cleanupFunction === cleanupFunction);
-
-    if (desiredGroup.length !== 1 || managedGroup.length !== 1) continue;
-
-    groups.push({
-      creation: desiredGroup[0],
-      scaffold: managedGroup[0]
-    });
-  }
-
-  return groups;
-}
-
-function isInsertEligibleForScope(scope, targetLineSet, lineNumber) {
+function isStatementEligibleForScope(scope, targetLineSet, startLine, endLine) {
   if (!scope || scope.kind === "document" || scope.kind === "function") {
     return true;
   }
 
-  return targetLineSet.has(lineNumber);
+  for (let lineNumber = startLine; lineNumber <= endLine; lineNumber++) {
+    if (targetLineSet.has(lineNumber)) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 function collectTakesOwnershipFunctions(rawLines, functions) {
@@ -515,21 +476,20 @@ function collectTakesOwnershipFunctions(rawLines, functions) {
   return takingOwnership;
 }
 
-function doesCreationTransferOwnership(fn, creationLine, varName, sanitizedLines, takesOwnershipFunctions) {
+function doesCreationTransferOwnership(creation, statements, takesOwnershipFunctions) {
   if (!takesOwnershipFunctions.size) return false;
 
-  const varPattern = new RegExp(`\\b${escapeRegExp(varName)}\\b`);
+  for (const statement of statements) {
+    if (statement.startLine <= creation.endLine) continue;
 
-  for (let i = creationLine + 1; i <= fn.endLine; i++) {
-    const trimmed = sanitizedLines[i].trim();
-    if (!trimmed || !trimmed.endsWith(";")) continue;
+    const call = parseCallStatement(statement.sanitizedText);
+    if (!call) continue;
+    if (!takesOwnershipFunctions.has(call.callee)) continue;
 
-    const callMatch = trimmed.match(
-      /^(?:[A-Za-z_]\w*\s*=\s*)?([A-Za-z_]\w*)\s*\((.*)\)\s*;\s*$/
-    );
-    if (!callMatch) continue;
-    if (!takesOwnershipFunctions.has(callMatch[1])) continue;
-    if (!varPattern.test(callMatch[2])) continue;
+    const argumentsList = splitTopLevelArguments(call.argsText);
+    if (!argumentsList.some((argument) => isDirectVariableArgument(argument, creation.varName))) {
+      continue;
+    }
 
     return true;
   }
@@ -564,6 +524,466 @@ function findManagedCleanupBelow(managedScaffolds, startLine, varName, cleanupFu
   }
 
   return null;
+}
+
+function collectRelevantStatements(fn, rawLines, sanitizedLines) {
+  const statements = [];
+  let current = null;
+
+  for (let lineNumber = fn.bodyStartLine; lineNumber <= fn.endLine; lineNumber++) {
+    const lineParts = getFunctionStatementLineParts(
+      fn,
+      lineNumber,
+      rawLines[lineNumber],
+      sanitizedLines[lineNumber]
+    );
+    const rawLine = lineParts.rawLine;
+    const sanitizedLine = lineParts.sanitizedLine;
+    const trimmed = sanitizedLine.trim();
+
+    if (!current) {
+      if (!looksLikeRelevantStatementStart(trimmed)) continue;
+
+      current = {
+        startLine: lineNumber,
+        endLine: lineNumber,
+        rawParts: [rawLine],
+        sanitizedParts: [sanitizedLine],
+        parenDepth: countChar(sanitizedLine, "(") - countChar(sanitizedLine, ")")
+      };
+    } else {
+      current.endLine = lineNumber;
+      current.rawParts.push(rawLine);
+      current.sanitizedParts.push(sanitizedLine);
+      current.parenDepth += countChar(sanitizedLine, "(") - countChar(sanitizedLine, ")");
+    }
+
+    if (current.parenDepth <= 0 && trimmed.includes(";")) {
+      statements.push({
+        startLine: current.startLine,
+        endLine: current.endLine,
+        rawText: current.rawParts.join("\n"),
+        sanitizedText: current.sanitizedParts.join(" ")
+      });
+      current = null;
+      continue;
+    }
+
+    if (current.rawParts.length > 8) {
+      current = null;
+    }
+  }
+
+  return statements;
+}
+
+function getFunctionStatementLineParts(fn, lineNumber, rawLine, sanitizedLine) {
+  let nextRawLine = rawLine;
+  let nextSanitizedLine = sanitizedLine;
+
+  if (lineNumber === fn.bodyStartLine) {
+    const openBraceIndex = nextSanitizedLine.indexOf("{");
+    if (openBraceIndex >= 0) {
+      nextRawLine = nextRawLine.slice(openBraceIndex + 1);
+      nextSanitizedLine = nextSanitizedLine.slice(openBraceIndex + 1);
+    }
+  }
+
+  if (lineNumber === fn.endLine) {
+    const closeBraceIndex = nextSanitizedLine.lastIndexOf("}");
+    if (closeBraceIndex >= 0) {
+      nextRawLine = nextRawLine.slice(0, closeBraceIndex);
+      nextSanitizedLine = nextSanitizedLine.slice(0, closeBraceIndex);
+    }
+  }
+
+  return {
+    rawLine: nextRawLine,
+    sanitizedLine: nextSanitizedLine
+  };
+}
+
+function looksLikeRelevantStatementStart(trimmedLine) {
+  if (!trimmedLine) return false;
+  if (/^(if|for|while|switch|else|do|case|default)\b/.test(trimmedLine)) return false;
+  return trimmedLine.includes("=") || trimmedLine.includes("(") || /^\s*return\b/.test(trimmedLine);
+}
+
+function collectDesiredCreations(
+  fn,
+  statements,
+  config,
+  ownedReturnFunctions,
+  takesOwnershipFunctions,
+  scope,
+  targetLineSet
+) {
+  const desiredCreations = [];
+  const transferredCreations = [];
+  const ownedReturnInfo = ownedReturnFunctions.get(fn.name) || null;
+
+  for (const statement of statements) {
+    const creation = parseOwnershipCreationStatement(statement, config, ownedReturnFunctions);
+    if (!creation) continue;
+
+    if (
+      ownedReturnInfo
+      && ownedReturnInfo.returnVar === creation.varName
+      && ownedReturnInfo.cleanupFunction === creation.cleanupFunction
+    ) {
+      transferredCreations.push({
+        ...creation,
+        line: statement.startLine,
+        endLine: statement.endLine
+      });
+      continue;
+    }
+
+    const desiredCreation = {
+      ...creation,
+      line: statement.startLine,
+      endLine: statement.endLine,
+      insertEligible: isStatementEligibleForScope(
+        scope,
+        targetLineSet,
+        statement.startLine,
+        statement.endLine
+      ),
+      optOutKey: buildManagedOwnershipKey(fn.name, creation.varName, creation.cleanupFunction)
+    };
+
+    if (doesCreationTransferOwnership(desiredCreation, statements, takesOwnershipFunctions)) {
+      transferredCreations.push(desiredCreation);
+      continue;
+    }
+
+    desiredCreations.push(desiredCreation);
+  }
+
+  return {
+    desiredCreations,
+    transferredCreations
+  };
+}
+
+function matchExactManagedScaffolds(rawLines, desiredCreations, managedScaffolds) {
+  const matchedDesired = new Set();
+  const matchedManaged = new Set();
+  const duplicateEdits = [];
+
+  for (let desiredIndex = 0; desiredIndex < desiredCreations.length; desiredIndex++) {
+    const creation = desiredCreations[desiredIndex];
+    const exactMatch = managedScaffolds.find(
+      (scaffold) => !matchedManaged.has(scaffold.line)
+        && scaffold.line > creation.endLine
+        && scaffold.varName === creation.varName
+        && scaffold.cleanupFunction === creation.cleanupFunction
+    );
+
+    if (!exactMatch) continue;
+
+    matchedDesired.add(desiredIndex);
+    matchedManaged.add(exactMatch.line);
+
+    if (exactMatch.line === creation.endLine + 1) {
+      duplicateEdits.push(
+        ...findDuplicateManagedCleanupEdits(
+          rawLines,
+          exactMatch.line,
+          creation.varName,
+          creation.cleanupFunction
+        )
+      );
+    }
+  }
+
+  return {
+    matchedDesired,
+    matchedManaged,
+    duplicateEdits
+  };
+}
+
+function matchTransferredManagedScaffolds(transferredCreations, managedScaffolds, matchedManaged) {
+  const edits = [];
+
+  for (const creation of transferredCreations) {
+    const managedScaffold = managedScaffolds.find(
+      (scaffold) => !matchedManaged.has(scaffold.line)
+        && scaffold.line > creation.endLine
+        && scaffold.varName === creation.varName
+        && scaffold.cleanupFunction === creation.cleanupFunction
+    );
+
+    if (!managedScaffold) continue;
+
+    matchedManaged.add(managedScaffold.line);
+    edits.push({
+      kind: "deleteLine",
+      lineNumber: managedScaffold.line
+    });
+  }
+
+  return edits;
+}
+
+function planSegmentRenameMatches(
+  desiredCreations,
+  managedScaffolds,
+  matchedDesired,
+  matchedManaged,
+  manualOptOuts
+) {
+  const desiredGroups = groupByCleanupFunction(
+    desiredCreations
+      .map((creation, index) => ({ ...creation, index }))
+      .filter(
+        (creation) => !matchedDesired.has(creation.index)
+          && creation.insertEligible
+          && !manualOptOuts.has(creation.optOutKey)
+      )
+  );
+  const managedGroups = groupByCleanupFunction(
+    managedScaffolds.filter((scaffold) => !matchedManaged.has(scaffold.line))
+  );
+  const cleanupFunctions = new Set([
+    ...desiredGroups.keys(),
+    ...managedGroups.keys()
+  ]);
+  const pairs = [];
+  const frozenDesired = new Set();
+  const frozenManaged = new Set();
+
+  for (const cleanupFunction of cleanupFunctions) {
+    const desiredGroup = desiredGroups.get(cleanupFunction) || [];
+    const managedGroup = managedGroups.get(cleanupFunction) || [];
+
+    if (!desiredGroup.length || !managedGroup.length) continue;
+
+    const groupPairs = [];
+    const usedManaged = new Set();
+
+    for (let index = 0; index < desiredGroup.length; index++) {
+      const creation = desiredGroup[index];
+      const nextCreationLine = desiredGroup[index + 1]?.line ?? Number.POSITIVE_INFINITY;
+      const candidate = findSegmentRenameCandidate(
+        creation,
+        nextCreationLine,
+        managedGroup,
+        usedManaged
+      );
+
+      if (candidate.kind === "pair") {
+        usedManaged.add(candidate.scaffold.line);
+        groupPairs.push(candidate);
+        continue;
+      }
+
+      if (candidate.kind === "ambiguous") {
+        frozenDesired.add(creation.index);
+        for (const scaffold of candidate.scaffolds) {
+          frozenManaged.add(scaffold.line);
+        }
+      }
+    }
+
+    for (const pair of groupPairs) {
+      if (frozenDesired.has(pair.creation.index) || frozenManaged.has(pair.scaffold.line)) {
+        continue;
+      }
+
+      pairs.push(pair);
+    }
+
+    const unresolvedDesired = desiredGroup.filter(
+      (creation) => !groupPairs.some((pair) => pair.creation.index === creation.index)
+    );
+    const unresolvedManaged = managedGroup.filter(
+      (scaffold) => !usedManaged.has(scaffold.line)
+    );
+
+    if (unresolvedDesired.length && unresolvedManaged.length) {
+      for (const creation of unresolvedDesired) {
+        frozenDesired.add(creation.index);
+      }
+
+      for (const scaffold of unresolvedManaged) {
+        frozenManaged.add(scaffold.line);
+      }
+    }
+  }
+
+  return {
+    pairs,
+    frozenDesired,
+    frozenManaged
+  };
+}
+
+function findSegmentRenameCandidate(creation, nextCreationLine, managedGroup, usedManaged) {
+  const segmentCandidates = managedGroup.filter(
+    (scaffold) => !usedManaged.has(scaffold.line)
+      && scaffold.line > creation.endLine
+      && scaffold.line < nextCreationLine
+  );
+
+  if (segmentCandidates.length === 1) {
+    return {
+      kind: "pair",
+      creation,
+      scaffold: segmentCandidates[0]
+    };
+  }
+
+  if (segmentCandidates.length > 1) {
+    return {
+      kind: "ambiguous",
+      scaffolds: segmentCandidates
+    };
+  }
+
+  return {
+    kind: "none"
+  };
+}
+
+function groupByCleanupFunction(entries) {
+  const groups = new Map();
+
+  for (const entry of entries) {
+    if (!groups.has(entry.cleanupFunction)) {
+      groups.set(entry.cleanupFunction, []);
+    }
+
+    groups.get(entry.cleanupFunction).push(entry);
+  }
+
+  for (const group of groups.values()) {
+    group.sort((a, b) => a.line - b.line);
+  }
+
+  return groups;
+}
+
+function isConfidentOrphanScaffold(fn, scaffold, statements) {
+  return !hasPlausibleVariableAssignment(fn, scaffold.varName, scaffold.line, statements);
+}
+
+function hasPlausibleVariableAssignment(fn, varName, scaffoldLine, statements) {
+  const escapedVarName = escapeRegExp(varName);
+  const typedPattern = new RegExp(
+    `^(?:[A-Za-z_]\\w*(?:\\s+|\\s*\\*+\\s*))+?${escapedVarName}\\s*=`
+  );
+  const plainPattern = new RegExp(`^${escapedVarName}\\s*=`);
+
+  return statements.some((statement) => {
+    if (statement.startLine < fn.bodyStartLine || statement.endLine >= scaffoldLine) {
+      return false;
+    }
+
+    const trimmed = compactSanitizedText(statement.sanitizedText);
+    return typedPattern.test(trimmed) || plainPattern.test(trimmed);
+  });
+}
+
+function parseCallStatement(sanitizedText) {
+  const trimmed = compactSanitizedText(sanitizedText);
+  if (!trimmed || !trimmed.endsWith(";")) return null;
+  if (/^(if|for|while|switch|return|sizeof)\b/.test(trimmed)) return null;
+
+  const match = trimmed.match(/^(?:.+?=\s*)?([A-Za-z_]\w*)\s*\((.*)\)\s*;\s*$/);
+  if (!match) return null;
+
+  return {
+    callee: match[1],
+    argsText: match[2]
+  };
+}
+
+function splitTopLevelArguments(argsText) {
+  const args = [];
+  let start = 0;
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  let braceDepth = 0;
+
+  for (let index = 0; index < argsText.length; index++) {
+    const ch = argsText[index];
+
+    if (ch === "(") parenDepth++;
+    else if (ch === ")") parenDepth = Math.max(0, parenDepth - 1);
+    else if (ch === "[") bracketDepth++;
+    else if (ch === "]") bracketDepth = Math.max(0, bracketDepth - 1);
+    else if (ch === "{") braceDepth++;
+    else if (ch === "}") braceDepth = Math.max(0, braceDepth - 1);
+
+    if (ch === "," && parenDepth === 0 && bracketDepth === 0 && braceDepth === 0) {
+      args.push(argsText.slice(start, index).trim());
+      start = index + 1;
+    }
+  }
+
+  const finalArg = argsText.slice(start).trim();
+  if (finalArg) {
+    args.push(finalArg);
+  }
+
+  return args;
+}
+
+function isDirectVariableArgument(argumentText, varName) {
+  let value = argumentText.trim();
+
+  if (!value) return false;
+
+  while (value) {
+    const unwrapped = stripWrappingParentheses(value);
+    if (unwrapped !== value) {
+      value = unwrapped.trim();
+      continue;
+    }
+
+    const castMatch = value.match(/^\(\s*([^()]+)\s*\)\s*(.+)$/);
+    if (!castMatch || !looksLikeCastType(castMatch[1])) {
+      break;
+    }
+
+    value = castMatch[2].trim();
+  }
+
+  return value === varName;
+}
+
+function stripWrappingParentheses(value) {
+  const trimmed = value.trim();
+  if (!hasWrappingParentheses(trimmed)) return trimmed;
+  return trimmed.slice(1, -1).trim();
+}
+
+function hasWrappingParentheses(value) {
+  if (!value.startsWith("(") || !value.endsWith(")")) return false;
+
+  let depth = 0;
+
+  for (let index = 0; index < value.length; index++) {
+    const ch = value[index];
+
+    if (ch === "(") depth++;
+    if (ch === ")") depth--;
+
+    if (depth === 0 && index < value.length - 1) {
+      return false;
+    }
+  }
+
+  return depth === 0;
+}
+
+function looksLikeCastType(typeText) {
+  if (/[+\-/%&|!?=,:.]/.test(typeText)) return false;
+  return /\*/.test(typeText)
+    || /^(?:const|volatile|unsigned|signed|short|long|struct|enum|union)\b/.test(typeText)
+    || /\s/.test(typeText);
 }
 
 function findFunctions(rawLines, sanitizedLines) {
@@ -780,6 +1200,15 @@ function formatScaffoldLine(indent, varName, cleanupFunction) {
 
 function formatCleanupLine(indent, varName, cleanupFunction) {
   return `${indent}${cleanupFunction}(${varName});`;
+}
+
+function compactSanitizedText(text) {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+function rawLinesIndent(rawText) {
+  const firstLine = rawText.split("\n", 1)[0] ?? "";
+  return firstLine.match(/^\s*/)?.[0] ?? "";
 }
 
 function buildManagedOwnershipKey(functionName, varName, cleanupFunction) {
