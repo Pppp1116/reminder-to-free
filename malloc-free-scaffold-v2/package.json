@@ -1,0 +1,69 @@
+{
+  "name": "malloc-free-scaffold-v2",
+  "displayName": "Malloc Free Scaffold V2",
+  "description": "Scaffolds free(...) for direct allocations and for caller-owned helper functions that return allocated memory.",
+  "version": "0.1.0",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "keywords": [
+    "c",
+    "cpp",
+    "malloc",
+    "free",
+    "memory",
+    "ownership"
+  ],
+  "activationEvents": [
+    "onLanguage:c",
+    "onLanguage:cpp",
+    "onCommand:mallocFreeScaffold.refreshDocument"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "mallocFreeScaffold.refreshDocument",
+        "title": "Malloc Free Scaffold: Refresh Current Document"
+      }
+    ],
+    "configuration": {
+      "title": "Malloc Free Scaffold",
+      "properties": {
+        "mallocFreeScaffold.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable automatic cleanup scaffolding for C/C++."
+        },
+        "mallocFreeScaffold.detectOwnedReturnFunctions": {
+          "type": "boolean",
+          "default": true,
+          "description": "Detect helper functions that allocate and return owned memory, then scaffold free(...) at call sites instead of inside the helper."
+        },
+        "mallocFreeScaffold.allocatorFunctions": {
+          "type": "array",
+          "default": [
+            "malloc",
+            "calloc",
+            "realloc",
+            "strdup",
+            "strndup"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "description": "Function names treated as allocation sources."
+        },
+        "mallocFreeScaffold.cleanupFunctionName": {
+          "type": "string",
+          "default": "free",
+          "description": "Cleanup function inserted for owned heap memory."
+        }
+      }
+    }
+  }
+}
