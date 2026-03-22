@@ -3,6 +3,7 @@ const core = require("./core");
 
 let isApplyingEdit = false;
 let scaffoldDecorationType = null;
+const documentStates = new Map();
 
 function activate(context) {
   scaffoldDecorationType = vscode.window.createTextEditorDecorationType({
@@ -51,9 +52,9 @@ function activate(context) {
         const editor = vscode.window.activeTextEditor;
         if (!editor || !isSupportedDocument(editor.document)) return;
 
-        const lines = getDocumentLines(editor.document);
+        const lines = getDocumentState(editor.document).lines;
         const edits = core.planFinalizeEdits(lines, getFinalizeScope(editor));
-        await applyPlannedEdits(editor, edits);
+        await applyPlannedEdits(editor, edits, lines);
       }
     ),
     vscode.commands.registerCommand(
@@ -62,35 +63,51 @@ function activate(context) {
         const editor = vscode.window.activeTextEditor;
         if (!editor || !isSupportedDocument(editor.document)) return;
 
-        const lines = getDocumentLines(editor.document);
+        const lines = getDocumentState(editor.document).lines;
         const edits = core.planFinalizeEdits(lines, { kind: "document" });
-        await applyPlannedEdits(editor, edits);
+        await applyPlannedEdits(editor, edits, lines);
       }
     ),
     vscode.workspace.onDidChangeTextDocument(async (event) => {
       if (isApplyingEdit) return;
+      if (!isSupportedDocument(event.document)) return;
 
       const editor = vscode.window.activeTextEditor;
       if (!editor) return;
       if (editor.document !== event.document) return;
 
+      const previousLines = getDocumentState(event.document).lines;
+      updateDocumentState(event.document, previousLines);
       await processDocument(event.document, {
         kind: "lines",
         lineNumbers: collectTouchedLines(event.contentChanges, event.document.lineCount)
       });
     }),
     vscode.window.onDidChangeActiveTextEditor((editor) => {
+      if (editor && isSupportedDocument(editor.document)) {
+        updateDocumentState(editor.document);
+      }
       refreshDecorations(editor);
     }),
     vscode.workspace.onDidOpenTextDocument((document) => {
+      if (isSupportedDocument(document)) {
+        updateDocumentState(document);
+      }
+
       const editor = vscode.window.activeTextEditor;
       if (editor && editor.document === document) {
         refreshDecorations(editor);
       }
+    }),
+    vscode.workspace.onDidCloseTextDocument((document) => {
+      documentStates.delete(getDocumentKey(document));
     })
   ];
 
   context.subscriptions.push(scaffoldDecorationType, ...subscriptions);
+  if (vscode.window.activeTextEditor && isSupportedDocument(vscode.window.activeTextEditor.document)) {
+    updateDocumentState(vscode.window.activeTextEditor.document);
+  }
   refreshDecorations(vscode.window.activeTextEditor);
 }
 
@@ -106,13 +123,16 @@ async function processDocument(document, scope) {
     return;
   }
 
-  const lines = getDocumentLines(document);
-  const plan = core.planScaffoldEdits(lines, config, scope);
-  await applyPlannedEdits(editor, plan.edits);
+  const documentState = getDocumentState(document);
+  const plan = core.planScaffoldEdits(documentState.lines, config, scope, {
+    manualOptOuts: [...documentState.optOuts]
+  });
+  await applyPlannedEdits(editor, plan.edits, documentState.lines);
 }
 
-async function applyPlannedEdits(editor, edits) {
+async function applyPlannedEdits(editor, edits, previousLines = getDocumentLines(editor.document)) {
   if (!edits.length) {
+    updateDocumentState(editor.document, previousLines);
     refreshDecorations(editor);
     return;
   }
@@ -145,6 +165,7 @@ async function applyPlannedEdits(editor, edits) {
     editor.selections = translatedSelections;
   } finally {
     isApplyingEdit = false;
+    updateDocumentState(editor.document, previousLines);
     refreshDecorations(editor);
   }
 }
@@ -158,7 +179,7 @@ function refreshDecorations(editor) {
     return;
   }
 
-  const lines = getDocumentLines(editor.document);
+  const lines = getDocumentState(editor.document).lines;
   const options = core.collectManagedScaffoldLines(lines).map((scaffold) => ({
     range: editor.document.lineAt(scaffold.line).range,
     hoverMessage: "Auto-inserted cleanup scaffold. Keep typing above it, move it when you want, or finalize it to make it yours."
@@ -186,7 +207,10 @@ function getConfig() {
       calloc: "free",
       realloc: "free",
       strdup: "free",
-      strndup: "free"
+      strndup: "free",
+      fopen: "fclose",
+      opendir: "closedir",
+      socket: "close"
     }),
     ownedReturnFunctions: config.get("ownedReturnFunctions", [])
   };
@@ -204,6 +228,89 @@ function getDocumentLines(document) {
   }
 
   return lines;
+}
+
+function getDocumentKey(document) {
+  return document.uri.toString();
+}
+
+function getDocumentState(document) {
+  const key = getDocumentKey(document);
+
+  if (!documentStates.has(key)) {
+    updateDocumentState(document);
+  }
+
+  return documentStates.get(key);
+}
+
+function updateDocumentState(document, previousLines) {
+  if (!isSupportedDocument(document)) {
+    return {
+      lines: [],
+      optOuts: new Set()
+    };
+  }
+
+  const key = getDocumentKey(document);
+  const previousState = documentStates.get(key);
+  const lines = getDocumentLines(document);
+  const optOuts = deriveManualOptOuts(
+    previousLines ?? previousState?.lines ?? [],
+    lines,
+    previousState?.optOuts ?? new Set()
+  );
+
+  const nextState = { lines, optOuts };
+  documentStates.set(key, nextState);
+  return nextState;
+}
+
+function deriveManualOptOuts(previousLines, currentLines, existingOptOuts) {
+  const currentManaged = collectCleanupKeys(currentLines, true);
+  const currentUnmanaged = collectCleanupKeys(currentLines, false);
+  const previousManaged = collectCleanupKeys(previousLines, true);
+  const nextOptOuts = new Set();
+
+  for (const key of existingOptOuts) {
+    if (currentUnmanaged.has(key)) {
+      nextOptOuts.add(key);
+    }
+  }
+
+  for (const key of previousManaged) {
+    if (currentManaged.has(key)) continue;
+    if (currentUnmanaged.has(key)) {
+      nextOptOuts.add(key);
+    }
+  }
+
+  return nextOptOuts;
+}
+
+function collectCleanupKeys(lines, markerPresent) {
+  if (!lines.length) return new Set();
+
+  const sanitizedLines = core.sanitizeLines(lines);
+  const functions = core.findFunctions(lines, sanitizedLines);
+  const keys = new Set();
+
+  for (let i = 0; i < lines.length; i++) {
+    const cleanup = core.parseCleanupCallLine(lines[i]);
+    if (!cleanup) continue;
+    if (cleanup.markerPresent !== markerPresent) continue;
+
+    const fn = findContainingFunction(functions, i);
+    if (!fn) continue;
+
+    keys.add(core.buildManagedOwnershipKey(fn.name, cleanup.varName, cleanup.cleanupFunction));
+  }
+
+  return keys;
+}
+
+function findContainingFunction(functions, lineNumber) {
+  return functions.find((fn) => lineNumber >= fn.startLine && lineNumber <= fn.endLine) || null;
 }
 
 function collectTouchedLines(changes, lineCount) {

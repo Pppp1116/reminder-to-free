@@ -3,7 +3,7 @@ const assert = require("node:assert/strict");
 
 const core = require("../core");
 
-test("inserts an immediate scaffold below a direct allocation", () => {
+test("inserts a marked free scaffold below a basic malloc assignment", () => {
   const lines = [
     "void f(void) {",
     "    char *buf = malloc(64);",
@@ -23,35 +23,11 @@ test("inserts an immediate scaffold below a direct allocation", () => {
   assert.equal(nextLines[2], "    free(buf); /* c-cleanup-scaffold */");
 });
 
-test("does not reinsert when a tagged scaffold has moved lower in the same function", () => {
-  const lines = [
-    "void f(void) {",
-    "    char *buf = malloc(64);",
-    "    puts(buf);",
-    "    free(buf); /* c-cleanup-scaffold */",
-    "}"
-  ];
-
-  const plan = core.planScaffoldEdits(lines, {});
-  assert.deepEqual(plan.edits, []);
-});
-
-test("does not insert when an exact user cleanup already exists below", () => {
-  const lines = [
-    "void f(void) {",
-    "    char *buf = malloc(64);",
-    "    free(buf);",
-    "}"
-  ];
-
-  const plan = core.planScaffoldEdits(lines, {});
-  assert.deepEqual(plan.edits, []);
-});
-
-test("adds a scaffold for simple owned-return helper calls", () => {
+test("caller-owned factories lose their internal scaffold and add one at the call site", () => {
   const lines = [
     "char *make_buf(void) {",
     "    char *buf = malloc(32);",
+    "    free(buf); /* c-cleanup-scaffold */",
     "    return buf;",
     "}",
     "",
@@ -60,12 +36,87 @@ test("adds a scaffold for simple owned-return helper calls", () => {
     "}"
   ];
 
-  const plan = core.planScaffoldEdits(lines, {}, { kind: "line", lineNumber: 6 });
+  const plan = core.planScaffoldEdits(lines, {});
+  assert.deepEqual(plan.edits, [
+    {
+      kind: "deleteLine",
+      lineNumber: 2
+    },
+    {
+      kind: "insert",
+      afterLine: 7,
+      text: "    free(value); /* c-cleanup-scaffold */"
+    }
+  ]);
+});
+
+test("duplicate prevention only looks at marked scaffolds", () => {
+  const lines = [
+    "void f(void) {",
+    "    char *buf = malloc(64);",
+    "    free(buf);",
+    "}"
+  ];
+
+  const plan = core.planScaffoldEdits(lines, {});
   assert.deepEqual(plan.edits, [
     {
       kind: "insert",
-      afterLine: 6,
-      text: "    free(value); /* c-cleanup-scaffold */"
+      afterLine: 1,
+      text: "    free(buf); /* c-cleanup-scaffold */"
+    }
+  ]);
+});
+
+test("removes exact duplicate marked scaffolds below the same creation", () => {
+  const lines = [
+    "void f(void) {",
+    "    char *buf = malloc(64);",
+    "    free(buf); /* c-cleanup-scaffold */",
+    "    free(buf); /* c-cleanup-scaffold */",
+    "}"
+  ];
+
+  const plan = core.planScaffoldEdits(lines, {});
+  assert.deepEqual(plan.edits, [
+    {
+      kind: "deleteLine",
+      lineNumber: 3
+    }
+  ]);
+});
+
+test("renames a marked scaffold when the allocated variable name changes in the same function", () => {
+  const lines = [
+    "void f(void) {",
+    "    char *data = malloc(64);",
+    "    free(buf); /* c-cleanup-scaffold */",
+    "}"
+  ];
+
+  const plan = core.planScaffoldEdits(lines, {}, { kind: "function", lineNumber: 1 });
+  assert.deepEqual(plan.edits, [
+    {
+      kind: "replaceLine",
+      lineNumber: 2,
+      text: "    free(data); /* c-cleanup-scaffold */"
+    }
+  ]);
+});
+
+test("deletes a marked scaffold when its allocation disappears", () => {
+  const lines = [
+    "void f(void) {",
+    "    puts(\"done\");",
+    "    free(buf); /* c-cleanup-scaffold */",
+    "}"
+  ];
+
+  const plan = core.planScaffoldEdits(lines, {}, { kind: "function", lineNumber: 1 });
+  assert.deepEqual(plan.edits, [
+    {
+      kind: "deleteLine",
+      lineNumber: 2
     }
   ]);
 });
@@ -100,29 +151,25 @@ test("supports @returns_owned above a multiline function header", () => {
   ]);
 });
 
-test("removes exact duplicate managed scaffolds directly below the creation line", () => {
+test("supports @takes_ownership by removing a managed scaffold for transferred ownership", () => {
   const lines = [
-    "void f(void) {",
-    "    char *buf = malloc(64);",
-    "    free(buf); /* c-cleanup-scaffold */",
+    "// @takes_ownership",
+    "void set_buf(char *buf) {",
+    "}",
+    "",
+    "void use_buf(void) {",
+    "    char *buf = malloc(32);",
+    "    set_buf(buf);",
     "    free(buf); /* c-cleanup-scaffold */",
     "}"
   ];
 
-  const plan = core.planScaffoldEdits(lines, {});
+  const plan = core.planScaffoldEdits(lines, {}, { kind: "function", lineNumber: 5 });
   assert.deepEqual(plan.edits, [
     {
       kind: "deleteLine",
-      lineNumber: 3
+      lineNumber: 7
     }
-  ]);
-
-  const nextLines = core.applyLineEdits(lines, plan.edits);
-  assert.deepEqual(nextLines, [
-    "void f(void) {",
-    "    char *buf = malloc(64);",
-    "    free(buf); /* c-cleanup-scaffold */",
-    "}"
   ]);
 });
 

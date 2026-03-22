@@ -93,9 +93,12 @@
             "calloc": "free",
             "realloc": "free",
             "strdup": "free",
-            "strndup": "free"
+            "strndup": "free",
+            "fopen": "fclose",
+            "opendir": "closedir",
+            "socket": "close"
           },
-          "description": "Allocator-to-cleanup mapping for direct assignment lines."
+          "description": "Allocation or resource acquisition function names mapped to their cleanup calls."
         },
         "cCleanupScaffold.ownedReturnFunctions": {
           "type": "array",

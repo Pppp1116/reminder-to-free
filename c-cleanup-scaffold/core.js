@@ -5,7 +5,10 @@ const DEFAULT_CLEANUP_MAP = Object.freeze({
   calloc: "free",
   realloc: "free",
   strdup: "free",
-  strndup: "free"
+  strndup: "free",
+  fopen: "fclose",
+  opendir: "closedir",
+  socket: "close"
 });
 
 const DEFAULT_SCOPE = Object.freeze({ kind: "document" });
@@ -40,7 +43,7 @@ function normalizeConfig(rawConfig = {}) {
   };
 }
 
-function planScaffoldEdits(rawLines, rawConfig = {}, scope = DEFAULT_SCOPE) {
+function planScaffoldEdits(rawLines, rawConfig = {}, scope = DEFAULT_SCOPE, runtimeState = {}) {
   const config = normalizeConfig(rawConfig);
   const sanitizedLines = sanitizeLines(rawLines);
   const functions = findFunctions(rawLines, sanitizedLines);
@@ -50,55 +53,36 @@ function planScaffoldEdits(rawLines, rawConfig = {}, scope = DEFAULT_SCOPE) {
     functions,
     config
   );
+  const takesOwnershipFunctions = collectTakesOwnershipFunctions(rawLines, functions);
   const targetLines = resolveTargetLines(scope, rawLines.length, functions);
+  const targetLineSet = new Set(targetLines);
+  const managedScaffoldLines = collectManagedScaffoldLines(rawLines);
+  const managedByFunction = groupManagedScaffoldsByFunction(managedScaffoldLines, functions);
+  const manualOptOuts = new Set(runtimeState.manualOptOuts || []);
   const edits = [];
 
-  for (const lineNumber of targetLines) {
-    const creation = parseOwnershipCreationLine(
-      rawLines[lineNumber],
-      sanitizedLines[lineNumber],
-      config,
-      ownedReturnFunctions
+  for (const fn of resolveRelevantFunctions(scope, functions, targetLineSet)) {
+    edits.push(
+      ...planFunctionScaffoldEdits(
+        rawLines,
+        sanitizedLines,
+        fn,
+        config,
+        ownedReturnFunctions,
+        takesOwnershipFunctions,
+        targetLineSet,
+        scope,
+        managedByFunction.get(fn.startLine) || [],
+        manualOptOuts
+      )
     );
-
-    if (!creation) continue;
-
-    const containingFunction = findContainingFunction(functions, lineNumber);
-    const maxLine = containingFunction ? containingFunction.endLine : rawLines.length - 1;
-    const existingCleanup = findCleanupBelow(
-      rawLines,
-      lineNumber,
-      creation.varName,
-      creation.cleanupFunction,
-      maxLine
-    );
-
-    if (!existingCleanup) {
-      edits.push({
-        kind: "insert",
-        afterLine: lineNumber,
-        text: formatScaffoldLine(creation.indent, creation.varName, creation.cleanupFunction)
-      });
-      continue;
-    }
-
-    if (existingCleanup.markerPresent && existingCleanup.line === lineNumber + 1) {
-      edits.push(
-        ...findDuplicateManagedCleanupEdits(
-          rawLines,
-          existingCleanup.line,
-          creation.varName,
-          creation.cleanupFunction
-        )
-      );
-    }
   }
 
   return {
     edits: dedupeEdits(edits),
     functions,
-    managedScaffoldLines: collectManagedScaffoldLines(rawLines),
-    ownedReturnFunctions
+    managedScaffoldLines,
+    ownedReturnFunctions: new Set(ownedReturnFunctions.keys())
   };
 }
 
@@ -151,53 +135,68 @@ function applyLineEdits(rawLines, edits) {
 }
 
 function collectOwnedReturnFunctions(rawLines, sanitizedLines, functions, config) {
-  const owned = new Set(config.ownedReturnFunctions);
+  const owned = new Map();
+
+  for (const functionName of config.ownedReturnFunctions) {
+    owned.set(functionName, {
+      cleanupFunction: config.cleanupFunctionName,
+      returnVar: null
+    });
+  }
 
   for (const fn of functions) {
-    if (hasAnnotationAbove(rawLines, fn.startLine, "@returns_owned")) {
-      owned.add(fn.name);
-      continue;
-    }
+    const explicitlyOwned = hasAnnotationAbove(rawLines, fn.startLine, "@returns_owned");
+    if (!explicitlyOwned && !config.detectOwnedReturnFunctions) continue;
 
-    if (!config.detectOwnedReturnFunctions) continue;
-    if (looksLikeOwnedReturnFactory(fn, rawLines, sanitizedLines, config)) {
-      owned.add(fn.name);
-    }
+    const analysis = analyzeOwnedReturnFunction(fn, rawLines, sanitizedLines, config);
+    if (!analysis) continue;
+
+    owned.set(fn.name, analysis);
   }
 
   return owned;
 }
 
-function looksLikeOwnedReturnFactory(fn, rawLines, sanitizedLines, config) {
-  const allocatedVars = new Set();
-  const returnVars = [];
+function analyzeOwnedReturnFunction(fn, rawLines, sanitizedLines, config) {
+  const createdVars = new Map();
+  let returnVar = null;
+  let sawReturn = false;
 
   for (let i = fn.bodyStartLine; i <= fn.endLine; i++) {
     const creation = parseOwnershipCreationLine(
       rawLines[i],
       sanitizedLines[i],
       config,
-      new Set()
+      new Map()
     );
 
-    if (creation && creation.cleanupFunction === config.cleanupFunctionName) {
-      allocatedVars.add(creation.varName);
-    }
+    if (creation) {
+      if (createdVars.has(creation.varName)) {
+        return null;
+      }
 
-    const returnMatch = sanitizedLines[i].match(/^\s*return\s+([A-Za-z_]\w*)\s*;\s*$/);
-    if (returnMatch) {
-      returnVars.push(returnMatch[1]);
-      continue;
+      createdVars.set(creation.varName, creation.cleanupFunction);
     }
 
     if (/^\s*return\b/.test(sanitizedLines[i])) {
-      returnVars.push(null);
+      if (sawReturn) return null;
+      sawReturn = true;
+
+      const returnMatch = sanitizedLines[i].match(/^\s*return\s+([A-Za-z_]\w*)\s*;\s*$/);
+      if (!returnMatch) return null;
+      returnVar = returnMatch[1];
     }
   }
 
-  if (returnVars.length !== 1) return false;
-  if (!returnVars[0]) return false;
-  return allocatedVars.has(returnVars[0]);
+  if (!returnVar) return null;
+  const cleanupFunction = createdVars.get(returnVar);
+
+  if (!cleanupFunction) return null;
+
+  return {
+    cleanupFunction,
+    returnVar
+  };
 }
 
 function parseOwnershipCreationLine(rawLine, sanitizedLine, config, ownedReturnFunctions) {
@@ -208,7 +207,10 @@ function parseOwnershipCreationLine(rawLine, sanitizedLine, config, ownedReturnF
   if (!assignment) return null;
 
   const cleanupFunction = config.cleanupMap[assignment.callee]
-    || (ownedReturnFunctions.has(assignment.callee) ? config.cleanupFunctionName : null);
+    || (ownedReturnFunctions instanceof Map ? ownedReturnFunctions.get(assignment.callee)?.cleanupFunction : null)
+    || (ownedReturnFunctions instanceof Set && ownedReturnFunctions.has(assignment.callee)
+      ? config.cleanupFunctionName
+      : null);
 
   if (!cleanupFunction) return null;
 
@@ -260,14 +262,14 @@ function parseManagedScaffoldLine(rawLine) {
 
 function findCleanupBelow(rawLines, startLine, varName, cleanupFunction, maxLine) {
   for (let i = startLine + 1; i <= maxLine && i < rawLines.length; i++) {
-    const cleanup = parseCleanupCallLine(rawLines[i]);
+    const cleanup = parseManagedScaffoldLine(rawLines[i]);
     if (!cleanup) continue;
     if (cleanup.varName !== varName) continue;
     if (cleanup.cleanupFunction !== cleanupFunction) continue;
 
     return {
       line: i,
-      markerPresent: cleanup.markerPresent
+      markerPresent: true
     };
   }
 
@@ -319,6 +321,249 @@ function resolveTargetLines(scope, lineCount, functions) {
   }
 
   return [];
+}
+
+function resolveRelevantFunctions(scope, functions, targetLineSet) {
+  if (!scope || scope.kind === "document") {
+    return functions.slice();
+  }
+
+  if ((scope.kind === "line" || scope.kind === "function") && Number.isInteger(scope.lineNumber)) {
+    const fn = findContainingFunction(functions, scope.lineNumber);
+    return fn ? [fn] : [];
+  }
+
+  if (scope.kind === "lines") {
+    const relevant = new Map();
+
+    for (const lineNumber of targetLineSet) {
+      const fn = findContainingFunction(functions, lineNumber);
+      if (!fn) continue;
+      relevant.set(fn.startLine, fn);
+    }
+
+    return [...relevant.values()];
+  }
+
+  return [];
+}
+
+function planFunctionScaffoldEdits(
+  rawLines,
+  sanitizedLines,
+  fn,
+  config,
+  ownedReturnFunctions,
+  takesOwnershipFunctions,
+  targetLineSet,
+  scope,
+  managedScaffolds,
+  manualOptOuts
+) {
+  const edits = [];
+  const desiredCreations = [];
+  const ownedReturnInfo = ownedReturnFunctions.get(fn.name) || null;
+
+  for (let i = fn.bodyStartLine; i <= fn.endLine; i++) {
+    const creation = parseOwnershipCreationLine(
+      rawLines[i],
+      sanitizedLines[i],
+      config,
+      ownedReturnFunctions
+    );
+
+    if (!creation) continue;
+    if (
+      ownedReturnInfo
+      && ownedReturnInfo.returnVar === creation.varName
+      && ownedReturnInfo.cleanupFunction === creation.cleanupFunction
+    ) {
+      continue;
+    }
+
+    if (doesCreationTransferOwnership(fn, i, creation.varName, sanitizedLines, takesOwnershipFunctions)) {
+      continue;
+    }
+
+    desiredCreations.push({
+      ...creation,
+      line: i,
+      insertEligible: isInsertEligibleForScope(scope, targetLineSet, i),
+      optOutKey: buildManagedOwnershipKey(fn.name, creation.varName, creation.cleanupFunction)
+    });
+  }
+
+  const matchedDesired = new Set();
+  const matchedManaged = new Set();
+
+  for (let desiredIndex = 0; desiredIndex < desiredCreations.length; desiredIndex++) {
+    const creation = desiredCreations[desiredIndex];
+    const existingCleanup = findManagedCleanupBelow(
+      managedScaffolds,
+      creation.line,
+      creation.varName,
+      creation.cleanupFunction
+    );
+
+    if (!existingCleanup) continue;
+
+    matchedDesired.add(desiredIndex);
+    matchedManaged.add(existingCleanup.line);
+
+    if (existingCleanup.line === creation.line + 1) {
+      edits.push(
+        ...findDuplicateManagedCleanupEdits(
+          rawLines,
+          existingCleanup.line,
+          creation.varName,
+          creation.cleanupFunction
+        )
+      );
+    }
+  }
+
+  const renameCandidates = desiredCreations
+    .map((creation, index) => ({ ...creation, index }))
+    .filter(
+      (creation) => !matchedDesired.has(creation.index)
+        && creation.insertEligible
+        && !manualOptOuts.has(creation.optOutKey)
+    );
+  const unmatchedManaged = managedScaffolds.filter((scaffold) => !matchedManaged.has(scaffold.line));
+  const renameGroups = groupRenameCandidates(renameCandidates, unmatchedManaged);
+
+  for (const group of renameGroups) {
+    if (!group.scaffold || !group.creation) continue;
+    if (group.scaffold.line <= group.creation.line) continue;
+
+    edits.push({
+      kind: "replaceLine",
+      lineNumber: group.scaffold.line,
+      text: formatScaffoldLine(
+        group.scaffold.indent,
+        group.creation.varName,
+        group.creation.cleanupFunction
+      )
+    });
+    matchedDesired.add(group.creation.index);
+    matchedManaged.add(group.scaffold.line);
+  }
+
+  for (let desiredIndex = 0; desiredIndex < desiredCreations.length; desiredIndex++) {
+    const creation = desiredCreations[desiredIndex];
+    if (matchedDesired.has(desiredIndex)) continue;
+    if (!creation.insertEligible) continue;
+    if (manualOptOuts.has(creation.optOutKey)) continue;
+
+    edits.push({
+      kind: "insert",
+      afterLine: creation.line,
+      text: formatScaffoldLine(creation.indent, creation.varName, creation.cleanupFunction)
+    });
+  }
+
+  for (const scaffold of managedScaffolds) {
+    if (matchedManaged.has(scaffold.line)) continue;
+
+    edits.push({
+      kind: "deleteLine",
+      lineNumber: scaffold.line
+    });
+  }
+
+  return edits;
+}
+
+function groupRenameCandidates(desiredCreations, unmatchedManaged) {
+  const allCleanupFunctions = new Set([
+    ...desiredCreations.map((creation) => creation.cleanupFunction),
+    ...unmatchedManaged.map((scaffold) => scaffold.cleanupFunction)
+  ]);
+  const groups = [];
+
+  for (const cleanupFunction of allCleanupFunctions) {
+    const desiredGroup = desiredCreations.filter((creation) => creation.cleanupFunction === cleanupFunction);
+    const managedGroup = unmatchedManaged.filter((scaffold) => scaffold.cleanupFunction === cleanupFunction);
+
+    if (desiredGroup.length !== 1 || managedGroup.length !== 1) continue;
+
+    groups.push({
+      creation: desiredGroup[0],
+      scaffold: managedGroup[0]
+    });
+  }
+
+  return groups;
+}
+
+function isInsertEligibleForScope(scope, targetLineSet, lineNumber) {
+  if (!scope || scope.kind === "document" || scope.kind === "function") {
+    return true;
+  }
+
+  return targetLineSet.has(lineNumber);
+}
+
+function collectTakesOwnershipFunctions(rawLines, functions) {
+  const takingOwnership = new Set();
+
+  for (const fn of functions) {
+    if (!hasAnnotationAbove(rawLines, fn.startLine, "@takes_ownership")) continue;
+    takingOwnership.add(fn.name);
+  }
+
+  return takingOwnership;
+}
+
+function doesCreationTransferOwnership(fn, creationLine, varName, sanitizedLines, takesOwnershipFunctions) {
+  if (!takesOwnershipFunctions.size) return false;
+
+  const varPattern = new RegExp(`\\b${escapeRegExp(varName)}\\b`);
+
+  for (let i = creationLine + 1; i <= fn.endLine; i++) {
+    const trimmed = sanitizedLines[i].trim();
+    if (!trimmed || !trimmed.endsWith(";")) continue;
+
+    const callMatch = trimmed.match(
+      /^(?:[A-Za-z_]\w*\s*=\s*)?([A-Za-z_]\w*)\s*\((.*)\)\s*;\s*$/
+    );
+    if (!callMatch) continue;
+    if (!takesOwnershipFunctions.has(callMatch[1])) continue;
+    if (!varPattern.test(callMatch[2])) continue;
+
+    return true;
+  }
+
+  return false;
+}
+
+function groupManagedScaffoldsByFunction(managedScaffolds, functions) {
+  const grouped = new Map();
+
+  for (const scaffold of managedScaffolds) {
+    const fn = findContainingFunction(functions, scaffold.line);
+    if (!fn) continue;
+
+    if (!grouped.has(fn.startLine)) {
+      grouped.set(fn.startLine, []);
+    }
+
+    grouped.get(fn.startLine).push(scaffold);
+  }
+
+  return grouped;
+}
+
+function findManagedCleanupBelow(managedScaffolds, startLine, varName, cleanupFunction) {
+  for (const scaffold of managedScaffolds) {
+    if (scaffold.line <= startLine) continue;
+    if (scaffold.varName !== varName) continue;
+    if (scaffold.cleanupFunction !== cleanupFunction) continue;
+
+    return scaffold;
+  }
+
+  return null;
 }
 
 function findFunctions(rawLines, sanitizedLines) {
@@ -537,6 +782,10 @@ function formatCleanupLine(indent, varName, cleanupFunction) {
   return `${indent}${cleanupFunction}(${varName});`;
 }
 
+function buildManagedOwnershipKey(functionName, varName, cleanupFunction) {
+  return `${functionName || "<global>"}:${cleanupFunction}:${varName}`;
+}
+
 function dedupeEdits(edits) {
   const seen = new Set();
   const result = [];
@@ -594,14 +843,20 @@ function countChar(text, char) {
   return count;
 }
 
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 module.exports = {
   SCAFFOLD_MARKER,
   applyLineEdits,
+  buildManagedOwnershipKey,
   collectManagedScaffoldLines,
   findFunctions,
   formatCleanupLine,
   formatScaffoldLine,
   normalizeConfig,
+  parseCleanupCallLine,
   parseManagedScaffoldLine,
   parseOwnershipCreationLine,
   planFinalizeEdits,
