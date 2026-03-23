@@ -5,7 +5,7 @@
   "version": "0.1.0",
   "publisher": "local",
   "scripts": {
-    "test": "node --test ./test/**/*.test.js"
+    "test": "node --test test/*.test.js"
   },
   "engines": {
     "vscode": "^1.85.0"
