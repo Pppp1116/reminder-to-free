@@ -1,5 +1,6 @@
 const vscode = require("vscode");
 const core = require("./core");
+const lifecycle = require("./lifecycle");
 
 let isApplyingEdit = false;
 let scaffoldDecorationType = null;
@@ -77,7 +78,23 @@ function activate(context) {
       if (editor.document !== event.document) return;
 
       const previousLines = getDocumentState(event.document).lines;
+      const currentLines = getDocumentLines(event.document);
+      const manualFinalizeLineNumbers = lifecycle.detectManualOwnershipLineNumbers(
+        previousLines,
+        currentLines,
+        collectTouchedLines(event.contentChanges, event.document.lineCount)
+      );
       updateDocumentState(event.document, previousLines);
+
+      if (manualFinalizeLineNumbers.length) {
+        const manualFinalizeEdits = core.planFinalizeEdits(currentLines, {
+          kind: "lines",
+          lineNumbers: manualFinalizeLineNumbers
+        });
+
+        await applyPlannedEdits(editor, manualFinalizeEdits, currentLines);
+      }
+
       await processDocument(event.document, {
         kind: "lines",
         lineNumbers: collectTouchedLines(event.contentChanges, event.document.lineCount)
@@ -267,50 +284,11 @@ function updateDocumentState(document, previousLines) {
 }
 
 function deriveManualOptOuts(previousLines, currentLines, existingOptOuts) {
-  const currentManaged = collectCleanupKeys(currentLines, true);
-  const currentUnmanaged = collectCleanupKeys(currentLines, false);
-  const previousManaged = collectCleanupKeys(previousLines, true);
-  const nextOptOuts = new Set();
-
-  for (const key of existingOptOuts) {
-    if (currentUnmanaged.has(key)) {
-      nextOptOuts.add(key);
-    }
-  }
-
-  for (const key of previousManaged) {
-    if (currentManaged.has(key)) continue;
-    if (currentUnmanaged.has(key)) {
-      nextOptOuts.add(key);
-    }
-  }
-
-  return nextOptOuts;
+  return lifecycle.deriveManualOptOuts(previousLines, currentLines, existingOptOuts);
 }
 
 function collectCleanupKeys(lines, markerPresent) {
-  if (!lines.length) return new Set();
-
-  const sanitizedLines = core.sanitizeLines(lines);
-  const functions = core.findFunctions(lines, sanitizedLines);
-  const keys = new Set();
-
-  for (let i = 0; i < lines.length; i++) {
-    const cleanup = core.parseCleanupCallLine(lines[i]);
-    if (!cleanup) continue;
-    if (cleanup.markerPresent !== markerPresent) continue;
-
-    const fn = findContainingFunction(functions, i);
-    if (!fn) continue;
-
-    keys.add(core.buildManagedOwnershipKey(fn.name, cleanup.varName, cleanup.cleanupFunction));
-  }
-
-  return keys;
-}
-
-function findContainingFunction(functions, lineNumber) {
-  return functions.find((fn) => lineNumber >= fn.startLine && lineNumber <= fn.endLine) || null;
+  return lifecycle.collectCleanupKeys(lines, markerPresent);
 }
 
 function collectTouchedLines(changes, lineCount) {
@@ -422,5 +400,9 @@ function deactivate() {
 
 module.exports = {
   activate,
-  deactivate
+  deactivate,
+  collectCleanupKeys,
+  collectTouchedLines,
+  deriveManualOptOuts,
+  detectManualOwnershipLineNumbers: lifecycle.detectManualOwnershipLineNumbers
 };

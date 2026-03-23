@@ -118,6 +118,56 @@ function collectManagedScaffoldLines(rawLines) {
   return scaffolds;
 }
 
+function collectSourceCreations(rawLines, rawConfig = {}) {
+  const config = normalizeConfig(rawConfig);
+  const sanitizedLines = sanitizeLines(rawLines);
+  const functions = findFunctions(rawLines, sanitizedLines);
+  const ownedReturnFunctions = collectOwnedReturnFunctions(
+    rawLines,
+    sanitizedLines,
+    functions,
+    config
+  );
+  const takesOwnershipFunctions = collectTakesOwnershipFunctions(rawLines, functions);
+  const creations = [];
+
+  for (const fn of functions) {
+    const statements = collectRelevantStatements(fn, rawLines, sanitizedLines);
+    const blockHints = buildFunctionBlockHints(fn, sanitizedLines);
+    const creationPlan = collectDesiredCreations(
+      fn,
+      statements,
+      blockHints,
+      config,
+      ownedReturnFunctions,
+      takesOwnershipFunctions,
+      { kind: "document" },
+      new Set(Array.from({ length: rawLines.length }, (_, index) => index))
+    );
+
+    for (const creation of creationPlan.desiredCreations) {
+      creations.push({ ...creation, functionName: fn.name, functionStartLine: fn.startLine });
+    }
+  }
+
+  return creations;
+}
+
+function collectBlockHints(rawLines) {
+  const sanitizedLines = sanitizeLines(rawLines);
+  const functions = findFunctions(rawLines, sanitizedLines);
+  const blockHints = new Map();
+
+  for (const fn of functions) {
+    const functionHints = buildFunctionBlockHints(fn, sanitizedLines);
+    for (const [lineNumber, blockKey] of functionHints.entries()) {
+      blockHints.set(lineNumber, blockKey);
+    }
+  }
+
+  return blockHints;
+}
+
 function applyLineEdits(rawLines, edits) {
   const nextLines = rawLines.slice();
 
@@ -219,6 +269,7 @@ function parseOwnershipCreationLine(rawLine, sanitizedLine, config, ownedReturnF
     varName: assignment.varName,
     cleanupFunction,
     callee: assignment.callee,
+    callSignature: assignment.callSignature,
     indent: rawLine.match(/^\s*/)?.[0] ?? ""
   };
 }
@@ -242,6 +293,7 @@ function parseOwnershipCreationStatement(statement, config, ownedReturnFunctions
     varName: assignment.varName,
     cleanupFunction,
     callee: assignment.callee,
+    callSignature: assignment.callSignature,
     indent: rawLinesIndent(statement.rawText)
   };
 }
@@ -253,10 +305,54 @@ function matchAssignedCall(trimmedLine) {
 
   if (!match) return null;
 
+  const callSignature = extractAssignedCallSignature(trimmedLine);
+  if (!callSignature) return null;
+
   return {
     varName: match[1],
-    callee: match[2]
+    callee: match[2],
+    callSignature
   };
+}
+
+function extractAssignedCallSignature(trimmedLine) {
+  const equalIndex = trimmedLine.indexOf("=");
+  if (equalIndex < 0) return null;
+
+  let rhs = trimmedLine.slice(equalIndex + 1).trim();
+  rhs = stripLeadingCast(rhs);
+
+  const calleeMatch = rhs.match(/^([A-Za-z_]\w*)\s*\(/);
+  if (!calleeMatch) return null;
+
+  const callee = calleeMatch[1];
+  const openParenIndex = rhs.indexOf("(", callee.length - 1);
+  if (openParenIndex < 0) return null;
+
+  let depth = 0;
+  for (let index = openParenIndex; index < rhs.length; index++) {
+    const ch = rhs[index];
+    if (ch === "(") depth++;
+    else if (ch === ")") depth--;
+
+    if (depth === 0) {
+      return compactSanitizedText(rhs.slice(0, index + 1));
+    }
+  }
+
+  return null;
+}
+
+function stripLeadingCast(value) {
+  let nextValue = value.trim();
+
+  while (nextValue.startsWith("(")) {
+    const castMatch = nextValue.match(/^\(\s*([^()]+)\s*\)\s*(.+)$/);
+    if (!castMatch || !looksLikeCastType(castMatch[1])) break;
+    nextValue = castMatch[2].trim();
+  }
+
+  return nextValue;
 }
 
 function parseCleanupCallLine(rawLine) {
@@ -370,9 +466,11 @@ function planFunctionScaffoldEdits(
 ) {
   const edits = [];
   const statements = collectRelevantStatements(fn, rawLines, sanitizedLines);
+  const blockHints = buildFunctionBlockHints(fn, sanitizedLines);
   const creationPlan = collectDesiredCreations(
     fn,
     statements,
+    blockHints,
     config,
     ownedReturnFunctions,
     takesOwnershipFunctions,
@@ -383,8 +481,12 @@ function planFunctionScaffoldEdits(
   const exactMatches = matchExactManagedScaffolds(rawLines, desiredCreations, managedScaffolds);
   const matchedDesired = new Set(exactMatches.matchedDesired);
   const matchedManaged = new Set(exactMatches.matchedManaged);
-  const frozenDesired = new Set();
-  const frozenManaged = new Set();
+  const frozenDesired = new Set(exactMatches.frozenDesired || []);
+  const frozenManaged = new Set(exactMatches.frozenManaged || []);
+  const repeatedIdentityFreeze = findRepeatedCreationIdentityFreeze(desiredCreations, managedScaffolds);
+
+  for (const index of repeatedIdentityFreeze.frozenDesired) frozenDesired.add(index);
+  for (const line of repeatedIdentityFreeze.frozenManaged) frozenManaged.add(line);
 
   edits.push(...exactMatches.duplicateEdits);
   edits.push(
@@ -417,13 +519,8 @@ function planFunctionScaffoldEdits(
     matchedManaged.add(pair.scaffold.line);
   }
 
-  for (const index of renamePlan.frozenDesired) {
-    frozenDesired.add(index);
-  }
-
-  for (const line of renamePlan.frozenManaged) {
-    frozenManaged.add(line);
-  }
+  for (const index of renamePlan.frozenDesired) frozenDesired.add(index);
+  for (const line of renamePlan.frozenManaged) frozenManaged.add(line);
 
   for (let desiredIndex = 0; desiredIndex < desiredCreations.length; desiredIndex++) {
     const creation = desiredCreations[desiredIndex];
@@ -449,6 +546,40 @@ function planFunctionScaffoldEdits(
   }
 
   return edits;
+}
+
+function findRepeatedCreationIdentityFreeze(desiredCreations, managedScaffolds) {
+  const indicesByIdentity = new Map();
+
+  for (let index = 0; index < desiredCreations.length; index++) {
+    const creation = desiredCreations[index];
+    const identity = `${creation.cleanupFunction}:${creation.varName}:${creation.blockKey || "root"}`;
+    if (!indicesByIdentity.has(identity)) {
+      indicesByIdentity.set(identity, []);
+    }
+    indicesByIdentity.get(identity).push(index);
+  }
+
+  const frozenDesired = new Set();
+  const frozenManaged = new Set();
+
+  for (const [identity, indices] of indicesByIdentity.entries()) {
+    if (indices.length < 2) continue;
+
+    for (const index of indices) frozenDesired.add(index);
+
+    const [cleanupFunction, varName] = identity.split(":");
+    for (const scaffold of managedScaffolds) {
+      if (scaffold.cleanupFunction === cleanupFunction && scaffold.varName === varName) {
+        frozenManaged.add(scaffold.line);
+      }
+    }
+  }
+
+  return {
+    frozenDesired,
+    frozenManaged
+  };
 }
 
 function isStatementEligibleForScope(scope, targetLineSet, startLine, endLine) {
@@ -603,6 +734,37 @@ function getFunctionStatementLineParts(fn, lineNumber, rawLine, sanitizedLine) {
   };
 }
 
+function buildFunctionBlockHints(fn, sanitizedLines) {
+  const hints = new Map();
+  const blockPath = [];
+  const childCounters = [0];
+
+  for (let lineNumber = fn.bodyStartLine; lineNumber <= fn.endLine; lineNumber++) {
+    hints.set(lineNumber, blockPath.length ? blockPath.join(".") : "root");
+
+    const { sanitizedLine } = getFunctionStatementLineParts(
+      fn,
+      lineNumber,
+      "",
+      sanitizedLines[lineNumber]
+    );
+
+    for (const ch of sanitizedLine) {
+      if (ch === "{") {
+        const nextChild = (childCounters[childCounters.length - 1] || 0) + 1;
+        childCounters[childCounters.length - 1] = nextChild;
+        blockPath.push(nextChild);
+        childCounters.push(0);
+      } else if (ch === "}" && blockPath.length) {
+        blockPath.pop();
+        childCounters.pop();
+      }
+    }
+  }
+
+  return hints;
+}
+
 function looksLikeRelevantStatementStart(trimmedLine) {
   if (!trimmedLine) return false;
   if (/^(if|for|while|switch|else|do|case|default)\b/.test(trimmedLine)) return false;
@@ -612,6 +774,7 @@ function looksLikeRelevantStatementStart(trimmedLine) {
 function collectDesiredCreations(
   fn,
   statements,
+  blockHints,
   config,
   ownedReturnFunctions,
   takesOwnershipFunctions,
@@ -621,6 +784,7 @@ function collectDesiredCreations(
   const desiredCreations = [];
   const transferredCreations = [];
   const ownedReturnInfo = ownedReturnFunctions.get(fn.name) || null;
+  const occurrenceCounts = new Map();
 
   for (const statement of statements) {
     const creation = parseOwnershipCreationStatement(statement, config, ownedReturnFunctions);
@@ -643,14 +807,24 @@ function collectDesiredCreations(
       ...creation,
       line: statement.startLine,
       endLine: statement.endLine,
+      blockKey: blockHints.get(statement.startLine) || "root",
+      creationKey: buildCreationKey(
+        fn,
+        {
+          ...creation,
+          blockKey: blockHints.get(statement.startLine) || "root"
+        },
+        occurrenceCounts
+      ),
       insertEligible: isStatementEligibleForScope(
         scope,
         targetLineSet,
         statement.startLine,
         statement.endLine
       ),
-      optOutKey: buildManagedOwnershipKey(fn.name, creation.varName, creation.cleanupFunction)
+      optOutKey: null
     };
+    desiredCreation.optOutKey = desiredCreation.creationKey;
 
     if (doesCreationTransferOwnership(desiredCreation, statements, takesOwnershipFunctions)) {
       transferredCreations.push(desiredCreation);
@@ -667,41 +841,160 @@ function collectDesiredCreations(
 }
 
 function matchExactManagedScaffolds(rawLines, desiredCreations, managedScaffolds) {
+  const desiredGroups = groupByCleanupFunction(
+    desiredCreations.map((creation, index) => ({ ...creation, index }))
+  );
+  const managedGroups = groupByCleanupFunction(managedScaffolds);
   const matchedDesired = new Set();
   const matchedManaged = new Set();
   const duplicateEdits = [];
+  const frozenDesired = new Set();
+  const frozenManaged = new Set();
 
-  for (let desiredIndex = 0; desiredIndex < desiredCreations.length; desiredIndex++) {
-    const creation = desiredCreations[desiredIndex];
-    const exactMatch = managedScaffolds.find(
-      (scaffold) => !matchedManaged.has(scaffold.line)
-        && scaffold.line > creation.endLine
-        && scaffold.varName === creation.varName
-        && scaffold.cleanupFunction === creation.cleanupFunction
-    );
+  for (const [cleanupFunction, desiredGroup] of desiredGroups.entries()) {
+    const managedGroup = managedGroups.get(cleanupFunction) || [];
+    if (!managedGroup.length) continue;
 
-    if (!exactMatch) continue;
+    const usedManaged = new Set();
 
-    matchedDesired.add(desiredIndex);
-    matchedManaged.add(exactMatch.line);
-
-    if (exactMatch.line === creation.endLine + 1) {
-      duplicateEdits.push(
-        ...findDuplicateManagedCleanupEdits(
-          rawLines,
-          exactMatch.line,
-          creation.varName,
-          creation.cleanupFunction
-        )
+    for (let index = 0; index < desiredGroup.length; index++) {
+      const creation = desiredGroup[index];
+      const previousCreationLine = desiredGroup[index - 1]?.line ?? -1;
+      const nextCreationLine = desiredGroup[index + 1]?.line ?? Number.POSITIVE_INFINITY;
+      const candidate = findSegmentExactCandidate(
+        creation,
+        previousCreationLine,
+        nextCreationLine,
+        managedGroup,
+        usedManaged
       );
+
+      if (candidate.kind === "pair") {
+        usedManaged.add(candidate.scaffold.line);
+        matchedDesired.add(candidate.creation.index);
+        matchedManaged.add(candidate.scaffold.line);
+
+        if (candidate.scaffold.line === candidate.creation.endLine + 1) {
+          duplicateEdits.push(
+            ...findDuplicateManagedCleanupEdits(
+              rawLines,
+              candidate.scaffold.line,
+              candidate.creation.varName,
+              candidate.creation.cleanupFunction
+            )
+          );
+        }
+
+        continue;
+      }
+
+      if (candidate.kind === "ambiguous") {
+        frozenDesired.add(creation.index);
+        for (const scaffold of candidate.scaffolds) {
+          frozenManaged.add(scaffold.line);
+        }
+      }
+    }
+
+    const remainingDesired = desiredGroup.filter((creation) => !matchedDesired.has(creation.index));
+    const remainingManaged = managedGroup.filter((scaffold) => !matchedManaged.has(scaffold.line));
+    const fallbackPairs = findUniqueExactFallbackPairs(remainingDesired, remainingManaged);
+
+    for (const pair of fallbackPairs) {
+      matchedDesired.add(pair.creation.index);
+      matchedManaged.add(pair.scaffold.line);
     }
   }
 
   return {
     matchedDesired,
     matchedManaged,
-    duplicateEdits
+    duplicateEdits,
+    frozenDesired,
+    frozenManaged
   };
+}
+
+function findUniqueExactFallbackPairs(desiredGroup, managedGroup) {
+  const desiredByVar = new Map();
+  const managedByVar = new Map();
+  const pairs = [];
+
+  for (const creation of desiredGroup) {
+    if (!desiredByVar.has(creation.varName)) desiredByVar.set(creation.varName, []);
+    desiredByVar.get(creation.varName).push(creation);
+  }
+
+  for (const scaffold of managedGroup) {
+    if (!managedByVar.has(scaffold.varName)) managedByVar.set(scaffold.varName, []);
+    managedByVar.get(scaffold.varName).push(scaffold);
+  }
+
+  for (const [varName, creations] of desiredByVar.entries()) {
+    const scaffolds = managedByVar.get(varName) || [];
+    if (creations.length !== 1 || scaffolds.length !== 1) continue;
+
+    const creation = creations[0];
+    const scaffold = scaffolds[0];
+    if (scaffold.line <= creation.endLine) continue;
+
+    pairs.push({ creation, scaffold });
+  }
+
+  return pairs;
+}
+
+function findSegmentExactCandidate(
+  creation,
+  previousCreationLine,
+  nextCreationLine,
+  managedGroup,
+  usedManaged
+) {
+  const matchingScaffolds = managedGroup.filter(
+    (scaffold) => !usedManaged.has(scaffold.line)
+      && scaffold.line > creation.endLine
+      && scaffold.line > previousCreationLine
+      && scaffold.line < nextCreationLine
+      && scaffold.varName === creation.varName
+  );
+
+  if (matchingScaffolds.length === 1) {
+    return {
+      kind: "pair",
+      creation,
+      scaffold: matchingScaffolds[0]
+    };
+  }
+
+  if (matchingScaffolds.length > 1) {
+    if (isConsecutiveManagedDuplicateCluster(matchingScaffolds)) {
+      return {
+        kind: "pair",
+        creation,
+        scaffold: matchingScaffolds[0]
+      };
+    }
+
+    return {
+      kind: "ambiguous",
+      scaffolds: matchingScaffolds
+    };
+  }
+
+  return {
+    kind: "none"
+  };
+}
+
+function isConsecutiveManagedDuplicateCluster(scaffolds) {
+  for (let index = 1; index < scaffolds.length; index++) {
+    if (scaffolds[index].line !== scaffolds[index - 1].line + 1) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 function matchTransferredManagedScaffolds(transferredCreations, managedScaffolds, matchedManaged) {
@@ -801,6 +1094,14 @@ function planSegmentRenameMatches(
     const unresolvedManaged = managedGroup.filter(
       (scaffold) => !usedManaged.has(scaffold.line)
     );
+
+    if (unresolvedDesired.length === 1 && unresolvedManaged.length === 1) {
+      pairs.push({
+        creation: unresolvedDesired[0],
+        scaffold: unresolvedManaged[0]
+      });
+      continue;
+    }
 
     if (unresolvedDesired.length && unresolvedManaged.length) {
       for (const creation of unresolvedDesired) {
@@ -1211,6 +1512,20 @@ function rawLinesIndent(rawText) {
   return firstLine.match(/^\s*/)?.[0] ?? "";
 }
 
+function buildCreationKey(fn, creation, occurrenceCounts) {
+  const functionName = fn?.name || "<global>";
+  const identityBase = [
+    functionName,
+    creation.blockKey || "root",
+    creation.cleanupFunction,
+    creation.callee,
+    creation.callSignature || creation.varName
+  ].join(":");
+  const occurrence = (occurrenceCounts.get(identityBase) || 0) + 1;
+  occurrenceCounts.set(identityBase, occurrence);
+  return `${identityBase}#${occurrence}`;
+}
+
 function buildManagedOwnershipKey(functionName, varName, cleanupFunction) {
   return `${functionName || "<global>"}:${cleanupFunction}:${varName}`;
 }
@@ -1280,6 +1595,8 @@ module.exports = {
   SCAFFOLD_MARKER,
   applyLineEdits,
   buildManagedOwnershipKey,
+  collectBlockHints,
+  collectSourceCreations,
   collectManagedScaffoldLines,
   findFunctions,
   formatCleanupLine,
